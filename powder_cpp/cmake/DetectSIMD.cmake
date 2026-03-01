@@ -1,0 +1,13 @@
+function(powder_apply_simd_compile_definitions target_name)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86")
+    target_compile_definitions(${target_name} INTERFACE POWDERCPP_ARCH_X86=1)
+  else()
+    target_compile_definitions(${target_name} INTERFACE POWDERCPP_ARCH_X86=0)
+  endif()
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_definitions(${target_name} INTERFACE POWDERCPP_COMPILER_GNUCLANG=1)
+  else()
+    target_compile_definitions(${target_name} INTERFACE POWDERCPP_COMPILER_GNUCLANG=0)
+  endif()
+endfunction()

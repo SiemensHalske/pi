@@ -69,3 +69,5 @@
 [2026-03-01 15:48:21.571] [INFO    ] [engine        ] Session ended cleanly
 [2026-03-01 15:49:23.582] [SUCCESS ] [engine        ] Simulation engine ready  rows=96  cols=103  fps=60  profile=balanced
 [2026-03-01 15:49:34.350] [INFO    ] [engine        ] Session ended cleanly
+[2026-03-01 15:50:03.305] [SUCCESS ] [engine        ] Simulation engine ready  rows=96  cols=103  fps=60  profile=balanced
+[2026-03-01 15:51:26.781] [INFO    ] [engine        ] Session ended cleanly
