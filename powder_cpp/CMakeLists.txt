@@ -88,18 +88,20 @@ add_library(engine_sim STATIC
 target_link_libraries(engine_sim PUBLIC powder_build_flags engine_core)
 
 add_library(engine_render STATIC
-  src/render/RenderStub.cpp
+  src/render/RuntimeShell.cpp
+  src/render/Renderer.cpp
 )
 target_link_libraries(engine_render PUBLIC powder_build_flags engine_core)
 
 add_library(engine_script STATIC
-  src/script/ScriptStub.cpp
+  src/script/LuaSandbox.cpp
 )
 target_link_libraries(engine_script PUBLIC powder_build_flags engine_core)
 
 add_library(engine_app STATIC
   src/app/App.cpp
   src/app/Cli.cpp
+  src/app/Console.cpp
 )
 target_link_libraries(engine_app PUBLIC powder_build_flags engine_core engine_sim engine_render engine_script)
 

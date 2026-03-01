@@ -45,3 +45,11 @@ add_executable(test_phase6_core
 target_link_libraries(test_phase6_core PRIVATE engine_sim engine_core powder_build_flags)
 
 add_test(NAME phase6_core COMMAND test_phase6_core)
+
+add_executable(test_phase7_core
+  phase7_core.cpp
+)
+
+target_link_libraries(test_phase7_core PRIVATE engine_app engine_render engine_script engine_sim engine_core powder_build_flags)
+
+add_test(NAME phase7_core COMMAND test_phase7_core)

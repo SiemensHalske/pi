@@ -120,3 +120,23 @@ All timestamps are in UTC (ISO 8601).
  URL: <https://en.wikipedia.org/wiki/Neo-Hookean_solid>  
  Accessed: 2026-03-01T16:46:28Z  
  Notes: Compressible Neo-Hookean stress model used for thermomechanical hyperelastic option under finite deformation gradient approximation.
+
+25. **GLFW Getting Started (Quick Guide)**  
+ URL: <https://www.glfw.org/docs/latest/quick_guide.html>  
+ Accessed: 2026-03-01T16:59:01Z  
+ Notes: Canonical init/create-context/poll/swap event-loop sequence used to shape runtime shell API boundaries.
+
+26. **GLFW Window Guide**  
+ URL: <https://www.glfw.org/docs/latest/window_guide.html>  
+ Accessed: 2026-03-01T16:59:01Z  
+ Notes: Window/framebuffer/swap-control semantics used for headless/windowed shell split and platform-layer responsibilities.
+
+27. **Lua 5.4 Reference Manual (C API, Environments, Protected Calls)**  
+ URL: <https://www.lua.org/manual/5.4/manual.html>  
+ Accessed: 2026-03-01T16:59:01Z  
+ Notes: Host embedding contract (`lua_pcall`, `_ENV`, registry, error/status handling) used to define sandbox access and hook execution constraints.
+
+28. **SDL3 API Category Index**  
+ URL: <https://wiki.libsdl.org/SDL3/CategoryAPI>  
+ Accessed: 2026-03-01T16:59:01Z  
+ Notes: Surveyed as alternate runtime shell path against GLFW for window/input/timing abstraction scope.
