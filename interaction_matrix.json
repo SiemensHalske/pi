@@ -1,48 +1,48 @@
 {
-  "rules": [
-    {
-      "name": "water_lava_quench",
-      "pair_names": ["water", "lava"],
-      "priority": 95,
-      "conditions": { "min_temp": 80.0 },
-      "products": [6, 2],
-      "energy_delta": 14.0,
-      "gas_release": 0.25,
-      "residue": 0,
-      "duration_ticks": 4
-    },
-    {
-      "name": "acid_wall_etch",
-      "pair_names": ["wall", "acid"],
-      "priority": 90,
-      "conditions": { "min_contact_progress": 0.2 },
-      "products": [1, 8],
-      "energy_delta": 3.0,
-      "gas_release": 0.15,
-      "residue": 7,
-      "duration_ticks": 6
-    },
-    {
-      "name": "acid_wood_breakdown",
-      "pair_names": ["wood", "acid"],
-      "priority": 85,
-      "conditions": { "min_contact_progress": 0.1 },
-      "products": [7, 8],
-      "energy_delta": 1.5,
-      "gas_release": 0.08,
-      "residue": 0,
-      "duration_ticks": 6
-    },
-    {
-      "name": "steam_condense",
-      "pair_names": ["water", "steam"],
-      "priority": 60,
-      "conditions": { "max_temp": 92.0 },
-      "products": [3, 3],
-      "energy_delta": -8.0,
-      "gas_release": 0.0,
-      "residue": 0,
-      "duration_ticks": 5
-    }
-  ]
+    "rules": [
+        {
+            "name": "water_lava_quench",
+            "pair_names": ["water", "lava"],
+            "priority": 95,
+            "conditions": { "min_temp": 80.0 },
+            "products": [6, 2],
+            "energy_delta": 14.0,
+            "gas_release": 0.25,
+            "residue": 0,
+            "duration_ticks": 4
+        },
+        {
+            "name": "acid_wall_etch",
+            "pair_names": ["wall", "acid"],
+            "priority": 90,
+            "conditions": { "min_contact_progress": 0.2 },
+            "products": [1, 8],
+            "energy_delta": 3.0,
+            "gas_release": 0.15,
+            "residue": 7,
+            "duration_ticks": 6
+        },
+        {
+            "name": "acid_wood_breakdown",
+            "pair_names": ["wood", "acid"],
+            "priority": 85,
+            "conditions": { "min_contact_progress": 0.1 },
+            "products": [7, 8],
+            "energy_delta": 1.5,
+            "gas_release": 0.08,
+            "residue": 0,
+            "duration_ticks": 6
+        },
+        {
+            "name": "steam_condense",
+            "pair_names": ["water", "steam"],
+            "priority": 60,
+            "conditions": { "max_temp": 92.0 },
+            "products": [3, 3],
+            "energy_delta": -8.0,
+            "gas_release": 0.0,
+            "residue": 0,
+            "duration_ticks": 5
+        }
+    ]
 }

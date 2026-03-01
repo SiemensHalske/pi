@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "profile": "balanced",
+  "grid": {
+    "rows": 24,
+    "cols": 32
+  },
+  "samples": 3,
+  "metrics": {
+    "divergence_rms": {
+      "mean": 5.796435055240839e-18,
+      "max": 6.251743802121159e-18,
+      "min": 5.479547539245756e-18
+    },
+    "divergence_max": {
+      "mean": 1.0041958574323343e-17,
+      "max": 1.1801640570922712e-17,
+      "min": 8.590019198456976e-18
+    },
+    "pressure_residual": {
+      "mean": 0.0003477116406429559,
+      "max": 0.00037510445690713823,
+      "min": 0.0003286647843196988
+    },
+    "pressure_iterations": {
+      "mean": 14.666666984558105,
+      "max": 28.0,
+      "min": 8.0
+    },
+    "pressure_active_fraction": {
+      "mean": 1.0,
+      "max": 1.0,
+      "min": 1.0
+    },
+    "pde_stage_ms": {
+      "mean": 329.4362487792969,
+      "max": 983.6625366210938,
+      "min": 2.151808023452759
+    },
+    "fluid_stage_ms": {
+      "mean": 330.4924011230469,
+      "max": 984.8126831054688,
+      "min": 3.171998977661133
+    },
+    "cfl": {
+      "mean": 9.176368450411874e-19,
+      "max": 9.205836759734076e-19,
+      "min": 9.144903533886123e-19
+    }
+  },
+  "solver": {
+    "numba_available": true,
+    "sparse_pressure_enabled": true,
+    "multigrid_enabled": false
+  },
+  "timestamp": 1772372642.8896208
+}
