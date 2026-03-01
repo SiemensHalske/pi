@@ -1,8 +1,11 @@
+import math
+
 from .world import *
 from .world import _safe_load_json
+from .state import SimulationState
 
 try:
-    from numba import njit
+    from numba import njit, prange
     _NUMBA_AVAILABLE = True
 except Exception:
     _NUMBA_AVAILABLE = False
@@ -11,6 +14,8 @@ except Exception:
         def _decorator(func):
             return func
         return _decorator
+
+    prange = range
 
 
 @njit(cache=True)
@@ -105,8 +110,563 @@ def _jacobi_pressure_numba(
 
     return p, iters_used, residual
 
+
+@njit(cache=True, fastmath=True)
+def _laplacian_5pt_numba(field, out):
+    rows, cols = field.shape
+    for r in range(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            out[r, c] = left + right + up + down - np.float32(4.0) * fc
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _laplacian_aniso_numba(field, out, dx2, dy2):
+    rows, cols = field.shape
+    for r in prange(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            out[r, c] = (left - np.float32(2.0) * fc + right) / dx2 + (up - np.float32(2.0) * fc + down) / dy2
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _pressure_jacobi_step_numba(p, rhs, active, solid_mask, dx2, dy2, denom, out):
+    rows, cols = p.shape
+    for r in prange(rows):
+        for c in range(cols):
+            if solid_mask[r, c] or (not active[r, c]):
+                out[r, c] = np.float32(0.0)
+                continue
+            pc = p[r, c]
+            pl = p[r, c - 1] if c > 0 else pc
+            pr = p[r, c + 1] if c < (cols - 1) else pc
+            pt = p[r - 1, c] if r > 0 else pc
+            pb = p[r + 1, c] if r < (rows - 1) else pc
+            out[r, c] = (((pl + pr) * dy2 + (pt + pb) * dx2 - rhs[r, c] * dx2 * dy2) / denom)
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _neighbor_avg4_numba(field, out):
+    rows, cols = field.shape
+    for r in prange(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            out[r, c] = np.float32(0.25) * (left + right + up + down)
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _neighbor_peak4_numba(field, out):
+    rows, cols = field.shape
+    for r in prange(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            m1 = left if left > right else right
+            m2 = up if up > down else down
+            out[r, c] = m1 if m1 > m2 else m2
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _grad_mag_numba(field, out, dx_inv, dy_inv):
+    rows, cols = field.shape
+    for r in prange(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            gx = np.float32(0.5) * (right - left) * dx_inv
+            gy = np.float32(0.5) * (down - up) * dy_inv
+            out[r, c] = np.sqrt(gx * gx + gy * gy)
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _grad_xy_numba(field, gx, gy, dx_inv, dy_inv):
+    rows, cols = field.shape
+    for r in prange(rows):
+        for c in range(cols):
+            fc = field[r, c]
+            left = field[r, c - 1] if c > 0 else fc
+            right = field[r, c + 1] if c < (cols - 1) else fc
+            up = field[r - 1, c] if r > 0 else fc
+            down = field[r + 1, c] if r < (rows - 1) else fc
+            gx[r, c] = np.float32(0.5) * (right - left) * dx_inv
+            gy[r, c] = np.float32(0.5) * (down - up) * dy_inv
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _shear_rate_kernel(grad_u_x, grad_u_y, grad_v_x, grad_v_y, out):
+    rows, cols = grad_u_x.shape
+    for r in prange(rows):
+        for c in range(cols):
+            du_dx = grad_u_x[r, c]
+            dv_dy = grad_v_y[r, c]
+            du_dy = grad_u_y[r, c]
+            dv_dx = grad_v_x[r, c]
+            shear = (du_dx - dv_dy)
+            shear = shear * shear + (du_dy + dv_dx) * (du_dy + dv_dx)
+            out[r, c] = np.sqrt(shear)
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _porous_influence_kernel(porous_f, lap, solid_mask, out):
+    rows, cols = porous_f.shape
+    for r in prange(rows):
+        for c in range(cols):
+            if solid_mask[r, c]:
+                out[r, c] = np.float32(0.0)
+                continue
+            val = (lap[r, c] + porous_f[r, c] * np.float32(5.0)) * np.float32(0.2)
+            if val < np.float32(0.0):
+                val = np.float32(0.0)
+            elif val > np.float32(1.0):
+                val = np.float32(1.0)
+            out[r, c] = val
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _pore_pressure_kernel(temp, moist, pore_coeff, out):
+    rows, cols = temp.shape
+    for r in prange(rows):
+        for c in range(cols):
+            t = temp[r, c]
+            out[r, c] = pore_coeff[r, c] * moist[r, c] * max(np.float32(0.0), t - np.float32(100.0))
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _structural_constitutive_kernel(
+    disp_x,
+    disp_y,
+    plastic_strain,
+    temperature,
+    solid_mask,
+    young,
+    nu,
+    alpha,
+    sigma_y,
+    neo_c1,
+    neo_d1,
+    hardening,
+    deg_start,
+    deg_end,
+    dx_inv,
+    dy_inv,
+    ambient,
+    thermal_strain_enabled,
+    thermal_degradation_enabled,
+    neo_hookean_enabled,
+    elastoplastic_enabled,
+    finite_strain_clip,
+    sigma_xx_new,
+    sigma_yy_new,
+    tau_xy_new,
+):
+    rows, cols = disp_x.shape
+    for r in prange(rows):
+        for c in range(cols):
+            if not solid_mask[r, c]:
+                plastic_strain[r, c] = np.float32(0.0)
+                sigma_xx_new[r, c] = np.float32(0.0)
+                sigma_yy_new[r, c] = np.float32(0.0)
+                tau_xy_new[r, c] = np.float32(0.0)
+                continue
+
+            ux = disp_x[r, c]
+            uy = disp_y[r, c]
+            ux_l = disp_x[r, c - 1] if c > 0 else ux
+            ux_r = disp_x[r, c + 1] if c < (cols - 1) else ux
+            ux_t = disp_x[r - 1, c] if r > 0 else ux
+            ux_b = disp_x[r + 1, c] if r < (rows - 1) else ux
+            uy_l = disp_y[r, c - 1] if c > 0 else uy
+            uy_r = disp_y[r, c + 1] if c < (cols - 1) else uy
+            uy_t = disp_y[r - 1, c] if r > 0 else uy
+            uy_b = disp_y[r + 1, c] if r < (rows - 1) else uy
+
+            eps_xx = np.float32(0.5) * (ux_r - ux_l) * dx_inv
+            eps_yy = np.float32(0.5) * (uy_b - uy_t) * dy_inv
+            eps_xy = np.float32(0.25) * ((ux_b - ux_t) * dy_inv + (uy_r - uy_l) * dx_inv)
+
+            eps_th = np.float32(0.0)
+            if thermal_strain_enabled:
+                eps_th = alpha[r, c] * (temperature[r, c] - ambient)
+
+            eps_xx_eff = eps_xx - eps_th - plastic_strain[r, c]
+            eps_yy_eff = eps_yy - eps_th - plastic_strain[r, c]
+            tr_eps = eps_xx_eff + eps_yy_eff
+
+            strength_factor = np.float32(1.0)
+            if thermal_degradation_enabled:
+                denom = max(np.float32(1.0), deg_end[r, c] - deg_start[r, c])
+                deg = (temperature[r, c] - deg_start[r, c]) / denom
+                if deg < np.float32(0.0):
+                    deg = np.float32(0.0)
+                elif deg > np.float32(1.0):
+                    deg = np.float32(1.0)
+                strength_factor = np.float32(1.0) - np.float32(0.9) * deg
+
+            E_eff = young[r, c] * strength_factor
+            nu_eff = nu[r, c]
+            if nu_eff < np.float32(0.01):
+                nu_eff = np.float32(0.01)
+            elif nu_eff > np.float32(0.49):
+                nu_eff = np.float32(0.49)
+            mu = E_eff / (np.float32(2.0) * (np.float32(1.0) + nu_eff))
+            lam = (E_eff * nu_eff) / max(np.float32(1.0e-6), (np.float32(1.0) + nu_eff) * (np.float32(1.0) - np.float32(2.0) * nu_eff))
+
+            sxx = np.float32(2.0) * mu * eps_xx_eff + lam * tr_eps
+            syy = np.float32(2.0) * mu * eps_yy_eff + lam * tr_eps
+            txy = np.float32(2.0) * mu * eps_xy
+
+            if neo_hookean_enabled:
+                clip = max(np.float32(0.05), finite_strain_clip)
+                ex = eps_xx
+                if ex < -clip:
+                    ex = -clip
+                elif ex > clip:
+                    ex = clip
+                ey = eps_yy
+                if ey < -clip:
+                    ey = -clip
+                elif ey > clip:
+                    ey = clip
+                gxy = eps_xy
+                if gxy < -clip:
+                    gxy = -clip
+                elif gxy > clip:
+                    gxy = clip
+                J = (np.float32(1.0) + ex) * (np.float32(1.0) + ey) - gxy * gxy
+                if J < np.float32(0.55):
+                    J = np.float32(0.55)
+                elif J > np.float32(1.8):
+                    J = np.float32(1.8)
+                volumetric = J - np.float32(1.0)
+                sxx += np.float32(2.0) * neo_c1[r, c] * ex + np.float32(2.0) * neo_d1[r, c] * volumetric
+                syy += np.float32(2.0) * neo_c1[r, c] * ey + np.float32(2.0) * neo_d1[r, c] * volumetric
+                txy += np.float32(2.0) * neo_c1[r, c] * gxy
+
+            yield_eff = sigma_y[r, c] * strength_factor
+            if elastoplastic_enabled:
+                vm = np.sqrt(max(np.float32(0.0), sxx * sxx - sxx * syy + syy * syy + np.float32(3.0) * txy * txy))
+                if vm > yield_eff:
+                    scale = yield_eff / max(vm, np.float32(1.0e-6))
+                    if scale < np.float32(0.05):
+                        scale = np.float32(0.05)
+                    sxx *= scale
+                    syy *= scale
+                    txy *= scale
+                    plastic_strain[r, c] = min(
+                        np.float32(0.5),
+                        plastic_strain[r, c] + (np.float32(1.0) - scale) * (np.float32(0.015) + hardening[r, c]),
+                    )
+
+            sigma_xx_new[r, c] = sxx
+            sigma_yy_new[r, c] = syy
+            tau_xy_new[r, c] = txy
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _structural_dynamics_kernel(
+    disp_x,
+    disp_y,
+    vel_x,
+    vel_y,
+    sigma_xx,
+    sigma_yy,
+    tau_xy,
+    sigma_xx_new,
+    sigma_yy_new,
+    tau_xy_new,
+    solid_mask,
+    rho,
+    dt_sub,
+    dx_inv,
+    dy_inv,
+    damping,
+    grav,
+):
+    rows, cols = disp_x.shape
+    for r in prange(rows):
+        for c in range(cols):
+            if not solid_mask[r, c]:
+                vel_x[r, c] = np.float32(0.0)
+                vel_y[r, c] = np.float32(0.0)
+                disp_x[r, c] = np.float32(0.0)
+                disp_y[r, c] = np.float32(0.0)
+                sigma_xx[r, c] = np.float32(0.0)
+                sigma_yy[r, c] = np.float32(0.0)
+                tau_xy[r, c] = np.float32(0.0)
+                continue
+
+            sxx = sigma_xx_new[r, c]
+            syy = sigma_yy_new[r, c]
+            txy = tau_xy_new[r, c]
+
+            sigma_xx[r, c] = sxx
+            sigma_yy[r, c] = syy
+            tau_xy[r, c] = txy
+
+            sxx_l = sigma_xx_new[r, c - 1] if c > 0 else sxx
+            sxx_r = sigma_xx_new[r, c + 1] if c < (cols - 1) else sxx
+            syy_t = sigma_yy_new[r - 1, c] if r > 0 else syy
+            syy_b = sigma_yy_new[r + 1, c] if r < (rows - 1) else syy
+            txy_l = tau_xy_new[r, c - 1] if c > 0 else txy
+            txy_r = tau_xy_new[r, c + 1] if c < (cols - 1) else txy
+            txy_t = tau_xy_new[r - 1, c] if r > 0 else txy
+            txy_b = tau_xy_new[r + 1, c] if r < (rows - 1) else txy
+
+            fx = np.float32(0.5) * ((sxx_r - sxx_l) * dx_inv + (txy_b - txy_t) * dy_inv)
+            fy = np.float32(0.5) * ((txy_r - txy_l) * dx_inv + (syy_b - syy_t) * dy_inv) + rho[r, c] * grav
+
+            inv_rho = np.float32(1.0) / max(np.float32(1.0), rho[r, c])
+            vx = (vel_x[r, c] + dt_sub * fx * inv_rho) * (np.float32(1.0) - damping)
+            vy = (vel_y[r, c] + dt_sub * fy * inv_rho) * (np.float32(1.0) - damping)
+            vel_x[r, c] = vx
+            vel_y[r, c] = vy
+
+            disp_x[r, c] = disp_x[r, c] + dt_sub * vx
+            disp_y[r, c] = disp_y[r, c] + dt_sub * vy
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def _stiff_kinetics_edc_kernel(
+    fuel_vapor,
+    oxygen_level,
+    temperature,
+    co2_density,
+    co_density,
+    h2o_vapor,
+    mixture_fraction,
+    turb_k,
+    turb_eps,
+    vel_x,
+    vel_y,
+    solid_mask,
+    A,
+    Ea,
+    ord_f,
+    ord_o,
+    stoich,
+    q_release,
+    edc_c,
+    dt,
+    R,
+    dx_inv,
+    dy_inv,
+    edc_enabled,
+    edc_min_eps,
+    edc_tau_min,
+    edc_tau_max,
+    arr_t_min,
+    arr_t_max,
+    newton_iters,
+    use_flow,
+):
+    rows, cols = fuel_vapor.shape
+    reacted_sum = np.float32(0.0)
+    for r in prange(rows):
+        for c in range(cols):
+            if solid_mask[r, c]:
+                turb_k[r, c] = max(turb_k[r, c], np.float32(1.0e-5))
+                turb_eps[r, c] = max(turb_eps[r, c], np.float32(1.0e-4))
+                continue
+
+            fuel0 = fuel_vapor[r, c]
+            if fuel0 < np.float32(0.0):
+                fuel0 = np.float32(0.0)
+            elif fuel0 > np.float32(1.0):
+                fuel0 = np.float32(1.0)
+            o20 = oxygen_level[r, c]
+            if o20 < np.float32(0.0):
+                o20 = np.float32(0.0)
+            elif o20 > np.float32(1.0):
+                o20 = np.float32(1.0)
+
+            temp = temperature[r, c]
+            if temp < arr_t_min:
+                temp = arr_t_min
+            elif temp > arr_t_max:
+                temp = arr_t_max
+
+            stoich_v = stoich[r, c]
+            A_v = A[r, c]
+            Ea_v = Ea[r, c]
+            ord_f_v = ord_f[r, c]
+            ord_o_v = ord_o[r, c]
+            q_v = q_release[r, c]
+            edc_c_v = edc_c[r, c]
+
+            u = vel_x[r, c] if use_flow else np.float32(0.0)
+            v = vel_y[r, c] if use_flow else np.float32(0.0)
+            k_loc = turb_k[r, c]
+            eps_loc = turb_eps[r, c]
+            if use_flow:
+                u_l = vel_x[r, c - 1] if c > 0 else u
+                u_r = vel_x[r, c + 1] if c < (cols - 1) else u
+                u_t = vel_x[r - 1, c] if r > 0 else u
+                u_b = vel_x[r + 1, c] if r < (rows - 1) else u
+                v_l = vel_y[r, c - 1] if c > 0 else v
+                v_r = vel_y[r, c + 1] if c < (cols - 1) else v
+                v_t = vel_y[r - 1, c] if r > 0 else v
+                v_b = vel_y[r + 1, c] if r < (rows - 1) else v
+                du_dx = np.float32(0.5) * (u_r - u_l) * dx_inv
+                dv_dy = np.float32(0.5) * (v_b - v_t) * dy_inv
+                du_dy = np.float32(0.5) * (u_b - u_t) * dy_inv
+                dv_dx = np.float32(0.5) * (v_r - v_l) * dx_inv
+                strain_mag = np.sqrt(max(np.float32(0.0), du_dx * du_dx + dv_dy * dv_dy + np.float32(0.5) * (du_dy + dv_dx) * (du_dy + dv_dx)))
+                k_loc = max(np.float32(1.0e-6), np.float32(0.5) * (u * u + v * v))
+                eps_loc = max(edc_min_eps, (np.float32(0.09) ** np.float32(0.75)) * k_loc * strain_mag)
+                turb_k[r, c] = k_loc
+                turb_eps[r, c] = eps_loc
+            else:
+                k_loc = max(np.float32(1.0e-6), k_loc)
+                eps_loc = max(edc_min_eps, eps_loc)
+                turb_k[r, c] = k_loc
+                turb_eps[r, c] = eps_loc
+
+            tau_mix = k_loc / max(eps_loc, edc_min_eps)
+            if tau_mix < edc_tau_min:
+                tau_mix = edc_tau_min
+            elif tau_mix > edc_tau_max:
+                tau_mix = edc_tau_max
+            mix = mixture_fraction[r, c]
+            if mix < np.float32(0.0):
+                mix = np.float32(0.0)
+            elif mix > np.float32(1.0):
+                mix = np.float32(1.0)
+            mix_factor = mix * (np.float32(1.0) - mix)
+            mix_factor = mix_factor * np.float32(4.0)
+            if mix_factor < np.float32(0.0):
+                mix_factor = np.float32(0.0)
+            elif mix_factor > np.float32(1.0):
+                mix_factor = np.float32(1.0)
+
+            k_arr = A_v * np.exp(-Ea_v / max(np.float32(1.0e-6), (R * temp)))
+            xi_max = fuel0
+            sto = max(stoich_v, np.float32(1.0e-6))
+            o2_cap = o20 / sto
+            if o2_cap < xi_max:
+                xi_max = o2_cap
+
+            active = (fuel0 > np.float32(1.0e-7)) and (o20 > np.float32(1.0e-7)) and (xi_max > np.float32(1.0e-9))
+            if not active:
+                continue
+
+            base_poly = (fuel0 ** ord_f_v) * (o20 ** ord_o_v)
+            if base_poly < np.float32(1.0e-9):
+                base_poly = np.float32(1.0e-9)
+            k_eff = k_arr
+            if edc_enabled:
+                edc_lim = edc_c_v * min(fuel0, o20 / sto) / tau_mix
+                limit_val = edc_lim / base_poly
+                if limit_val < k_eff:
+                    k_eff = limit_val
+            k_eff = k_eff * mix_factor
+
+            xi = np.float32(0.0)
+            for _ in range(newton_iters):
+                yf = fuel0 - xi
+                yo = o20 - sto * xi
+                if yf < np.float32(1.0e-12):
+                    yf = np.float32(1.0e-12)
+                if yo < np.float32(1.0e-12):
+                    yo = np.float32(1.0e-12)
+                f = xi - dt * k_eff * (yf ** ord_f_v) * (yo ** ord_o_v)
+                df = np.float32(1.0) + dt * k_eff * (
+                    ord_f_v * (yf ** max(np.float32(0.0), ord_f_v - np.float32(1.0))) * (yo ** ord_o_v)
+                    + sto * ord_o_v * (yf ** ord_f_v) * (yo ** max(np.float32(0.0), ord_o_v - np.float32(1.0)))
+                )
+                step = f / max(np.float32(1.0e-9), df)
+                xi -= step
+                if xi < np.float32(0.0):
+                    xi = np.float32(0.0)
+                elif xi > xi_max:
+                    xi = xi_max
+
+            fuel_new = fuel0 - xi
+            if fuel_new < np.float32(0.0):
+                fuel_new = np.float32(0.0)
+            o2_new = o20 - sto * xi
+            if o2_new < np.float32(0.0):
+                o2_new = np.float32(0.0)
+
+            rich = np.float32(1.0) - (o20 / max(np.float32(1.0e-6), sto * fuel0 + np.float32(1.0e-6)))
+            if rich < np.float32(0.0):
+                rich = np.float32(0.0)
+            elif rich > np.float32(1.0):
+                rich = np.float32(1.0)
+            complete = np.float32(1.0) - rich
+
+            fuel_vapor[r, c] = fuel_new
+            oxygen_level[r, c] = o2_new
+            co2_next = co2_density[r, c] + xi * (np.float32(0.78) * complete + np.float32(0.3) * rich)
+            if co2_next < np.float32(0.0):
+                co2_next = np.float32(0.0)
+            elif co2_next > np.float32(2.0):
+                co2_next = np.float32(2.0)
+            co2_density[r, c] = co2_next
+
+            co_next = co_density[r, c] + xi * (np.float32(0.02) * complete + np.float32(0.45) * rich)
+            if co_next < np.float32(0.0):
+                co_next = np.float32(0.0)
+            elif co_next > np.float32(1.0):
+                co_next = np.float32(1.0)
+            co_density[r, c] = co_next
+
+            h2o_next = h2o_vapor[r, c] + xi * np.float32(0.5)
+            if h2o_next < np.float32(0.0):
+                h2o_next = np.float32(0.0)
+            elif h2o_next > np.float32(2.0):
+                h2o_next = np.float32(2.0)
+            h2o_vapor[r, c] = h2o_next
+
+            heat = q_v * xi * (np.float32(0.7) + np.float32(0.3) * complete)
+            temperature[r, c] = temperature[r, c] + heat * np.float32(2.0e-5)
+            mf = fuel_new / max(np.float32(1.0e-6), fuel_new + o2_new / max(np.float32(1.0e-6), sto))
+            if mf < np.float32(0.0):
+                mf = np.float32(0.0)
+            elif mf > np.float32(1.0):
+                mf = np.float32(1.0)
+            mixture_fraction[r, c] = mf
+            reacted_sum += xi
+
+    return reacted_sum
+
 class PowderPhysicsEngine:
     """Dedicated physics engine for granular and fluid cellular behavior."""
+    _state_fields = set(SimulationState.__annotations__.keys())
+
+    def __getattr__(self, name):
+        state = self.__dict__.get("state")
+        if state is not None and name in PowderPhysicsEngine._state_fields:
+            return getattr(state, name)
+        raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!s}")
+
+    def __setattr__(self, name, value):
+        if name == "state":
+            object.__setattr__(self, name, value)
+            return
+        state = self.__dict__.get("state")
+        if state is not None and name in PowderPhysicsEngine._state_fields:
+            object.__setattr__(state, name, value)
+            return
+        object.__setattr__(self, name, value)
+
     def __init__(self, materials, material_ids, config: PhysicsConfig | None = None):
         self.materials = materials
         self.material_ids = material_ids
@@ -118,6 +678,7 @@ class PowderPhysicsEngine:
         self.thermal_config = ThermalCombustionConfig()
         self.chemistry_config = ChemistryConfig()
         self.phase_change_config = PhaseChangeConfig()
+        self.state = SimulationState()
         self.interaction_table = self._create_interaction_table()
         self.lateral_bias = []
         self.jammed_until = []
@@ -184,11 +745,18 @@ class PowderPhysicsEngine:
         self.acoustic_u = np.zeros((0, 0), dtype=np.float32)
         self.acoustic_v = np.zeros((0, 0), dtype=np.float32)
         self.porous_resistance = np.zeros((0, 0), dtype=np.float32)
+        self.em_ex = np.zeros((0, 0), dtype=np.float32)
+        self.em_ey = np.zeros((0, 0), dtype=np.float32)
+        self.em_bz = np.zeros((0, 0), dtype=np.float32)
+        self.current_x = np.zeros((0, 0), dtype=np.float32)
+        self.current_y = np.zeros((0, 0), dtype=np.float32)
+        self.joule_heating_source = np.zeros((0, 0), dtype=np.float32)
         self.pending_detonations = []
         # Per-substep wall-clock timings in ms (Schritt 8)
         self.substep_timings: dict = {}
         self.last_cfl: float = 0.0
         self.pressure_solver_stats: dict = {}
+        self.em_solver_stats: dict = {}
         self.pde_validation_metrics: dict = {}
         self._numba_available = _NUMBA_AVAILABLE
 
@@ -493,6 +1061,12 @@ class PowderPhysicsEngine:
             and isinstance(self.acoustic_u, np.ndarray) and self.acoustic_u.shape == (rows, cols)
             and isinstance(self.acoustic_v, np.ndarray) and self.acoustic_v.shape == (rows, cols)
             and isinstance(self.porous_resistance, np.ndarray) and self.porous_resistance.shape == (rows, cols)
+            and isinstance(self.em_ex, np.ndarray) and self.em_ex.shape == (rows, cols)
+            and isinstance(self.em_ey, np.ndarray) and self.em_ey.shape == (rows, cols)
+            and isinstance(self.em_bz, np.ndarray) and self.em_bz.shape == (rows, cols)
+            and isinstance(self.current_x, np.ndarray) and self.current_x.shape == (rows, cols)
+            and isinstance(self.current_y, np.ndarray) and self.current_y.shape == (rows, cols)
+            and isinstance(self.joule_heating_source, np.ndarray) and self.joule_heating_source.shape == (rows, cols)
         )
         mac_ok = (
             isinstance(self.mac_u, np.ndarray) and self.mac_u.shape == (rows, cols + 1)
@@ -521,6 +1095,12 @@ class PowderPhysicsEngine:
             self.acoustic_u = np.zeros((rows, cols), dtype=np.float32)
             self.acoustic_v = np.zeros((rows, cols), dtype=np.float32)
             self.porous_resistance = np.zeros((rows, cols), dtype=np.float32)
+            self.em_ex = np.zeros((rows, cols), dtype=np.float32)
+            self.em_ey = np.zeros((rows, cols), dtype=np.float32)
+            self.em_bz = np.full((rows, cols), np.float32(self.fluid_config.em_background_bz), dtype=np.float32)
+            self.current_x = np.zeros((rows, cols), dtype=np.float32)
+            self.current_y = np.zeros((rows, cols), dtype=np.float32)
+            self.joule_heating_source = np.zeros((rows, cols), dtype=np.float32)
 
         if not mac_ok:
             self.mac_u = np.zeros((rows, cols + 1), dtype=np.float32)
@@ -580,25 +1160,202 @@ class PowderPhysicsEngine:
 
         if np.any(porous_mask):
             porous_f = porous_mask.astype(np.float32)
-            p_l = np.empty_like(porous_f)
-            p_r = np.empty_like(porous_f)
-            p_t = np.empty_like(porous_f)
-            p_b = np.empty_like(porous_f)
-            p_l[:, 0] = porous_f[:, 0]
-            p_l[:, 1:] = porous_f[:, :-1]
-            p_r[:, -1] = porous_f[:, -1]
-            p_r[:, :-1] = porous_f[:, 1:]
-            p_t[0, :] = porous_f[0, :]
-            p_t[1:, :] = porous_f[:-1, :]
-            p_b[-1, :] = porous_f[-1, :]
-            p_b[:-1, :] = porous_f[1:, :]
-            influence = np.clip((porous_f + p_l + p_r + p_t + p_b) * np.float32(0.2), 0.0, 1.0)
-            influence[solid_mask] = 0.0
-            self.porous_resistance = influence.astype(np.float32)
+            lap = self._get_work_buffer("porous_lap", (rows, cols), np.float32)
+            _laplacian_5pt_numba(porous_f, lap)
+            influence = self._get_work_buffer("porous_influence", (rows, cols), np.float32)
+            _porous_influence_kernel(porous_f, lap, solid_mask, influence)
+            self.porous_resistance = influence
         else:
             self.porous_resistance.fill(0.0)
 
         return solid_mask, nu_field, grid_np, porous_mask
+
+    def _build_em_material_fields(self, grid_np, rows, cols):
+        sigma = np.zeros((rows, cols), dtype=np.float32)
+        mu_r = np.ones((rows, cols), dtype=np.float32)
+        plasma_mask = np.zeros((rows, cols), dtype=np.bool_)
+
+        for mat_id, mat_data in self.materials.items():
+            mask = (grid_np == int(mat_id))
+            if not np.any(mask):
+                continue
+
+            sigma_val = np.float32(max(0.0, float(self._mat_value(mat_data, "electrical_conductivity", 0.0))))
+            mu_val = np.float32(max(0.01, float(self._mat_value(mat_data, "magnetic_permeability", 1.0))))
+            sigma[mask] = sigma_val
+            mu_r[mask] = mu_val
+
+            ion_temp = float(self._mat_value(mat_data, "ionization_temp", 9999.0))
+            mat_type = str(mat_data.get("type", "air"))
+            if isinstance(self.temperature, np.ndarray) and self.temperature.shape == (rows, cols):
+                hot_mask = mask & (self.temperature >= np.float32(ion_temp))
+                if np.any(hot_mask):
+                    sigma[hot_mask] = np.maximum(sigma[hot_mask], np.float32(0.08))
+                    if mat_type == "gas":
+                        plasma_mask[hot_mask] = True
+
+        if isinstance(self.fuel_vapor, np.ndarray) and self.fuel_vapor.shape == (rows, cols):
+            plasma_mask |= (self.fuel_vapor > np.float32(0.03)) & (sigma > np.float32(0.02))
+
+        return sigma.astype(np.float32), mu_r.astype(np.float32), plasma_mask
+
+    def _update_em_fdtd(self, grid_np, rows, cols):
+        if not bool(self.fluid_config.em_enabled):
+            self.current_x.fill(0.0)
+            self.current_y.fill(0.0)
+            self.joule_heating_source.fill(0.0)
+            self.em_solver_stats = {
+                "enabled": False,
+                "substeps": 0,
+            }
+            return
+
+        sigma, mu_r, plasma_mask = self._build_em_material_fields(grid_np, rows, cols)
+        c_eff = np.float32(max(0.1, float(self.fluid_config.em_low_speed_light)))
+        eps0 = np.float32(max(1.0e-6, float(self.fluid_config.em_eps0)))
+        mu0 = np.float32(max(1.0e-6, float(self.fluid_config.em_mu0)))
+        c2 = np.float32(c_eff * c_eff)
+
+        inv_dx2 = np.float32(PHYSICS.dx_inv * PHYSICS.dx_inv)
+        inv_dy2 = np.float32(PHYSICS.dy_inv * PHYSICS.dy_inv)
+        dt_stable = np.float32(0.95 / max(1.0e-6, c_eff * np.sqrt(inv_dx2 + inv_dy2)))
+        dt = np.float32(PHYSICS.dt)
+        min_sub = int(max(1, self.fluid_config.em_substeps_min))
+        max_sub = int(max(min_sub, self.fluid_config.em_substeps_max))
+        n_sub = int(np.clip(np.ceil(float(dt / max(dt_stable, 1.0e-6))), min_sub, max_sub))
+        dt_sub = np.float32(dt / max(1, n_sub))
+        damping = np.float32(max(0.0, float(self.fluid_config.em_damping)))
+        cur_scale = np.float32(max(0.0, float(self.fluid_config.em_current_scale)))
+
+        ex = self.em_ex.astype(np.float32, copy=True)
+        ey = self.em_ey.astype(np.float32, copy=True)
+        bz = self.em_bz.astype(np.float32, copy=True)
+        jx = np.zeros_like(ex)
+        jy = np.zeros_like(ey)
+        e_clip = np.float32(180.0)
+        b_clip = np.float32(35.0)
+        j_clip = np.float32(120.0)
+        f_clip = np.float32(250.0)
+
+        for _ in range(n_sub):
+            dEy_dx = np.zeros_like(ey)
+            dEx_dy = np.zeros_like(ex)
+            dEy_dx[:, :-1] = (ey[:, 1:] - ey[:, :-1]) * np.float32(PHYSICS.dx_inv)
+            dEx_dy[:-1, :] = (ex[1:, :] - ex[:-1, :]) * np.float32(PHYSICS.dy_inv)
+            curl_e = dEy_dx - dEx_dy
+            bz -= dt_sub * (curl_e / (mu0 * mu_r))
+
+            uxb_x = self.vel_y * bz
+            uxb_y = -self.vel_x * bz
+            jx = (sigma * (ex + uxb_x) * cur_scale).astype(np.float32)
+            jy = (sigma * (ey + uxb_y) * cur_scale).astype(np.float32)
+            jx = np.clip(np.nan_to_num(jx, nan=0.0, posinf=float(j_clip), neginf=-float(j_clip)), -j_clip, j_clip)
+            jy = np.clip(np.nan_to_num(jy, nan=0.0, posinf=float(j_clip), neginf=-float(j_clip)), -j_clip, j_clip)
+
+            dB_dy = np.zeros_like(bz)
+            dB_dx = np.zeros_like(bz)
+            dB_dy[1:, :] = (bz[1:, :] - bz[:-1, :]) * np.float32(PHYSICS.dy_inv)
+            dB_dx[:, 1:] = (bz[:, 1:] - bz[:, :-1]) * np.float32(PHYSICS.dx_inv)
+            ex += dt_sub * (c2 * dB_dy - (jx / eps0))
+            ey += dt_sub * (-c2 * dB_dx - (jy / eps0))
+            ex = np.clip(np.nan_to_num(ex, nan=0.0, posinf=float(e_clip), neginf=-float(e_clip)), -e_clip, e_clip)
+            ey = np.clip(np.nan_to_num(ey, nan=0.0, posinf=float(e_clip), neginf=-float(e_clip)), -e_clip, e_clip)
+            bz = np.clip(np.nan_to_num(bz, nan=0.0, posinf=float(b_clip), neginf=-float(b_clip)), -b_clip, b_clip)
+
+            if damping > 0.0:
+                decay = np.float32(max(0.0, 1.0 - damping * float(dt_sub)))
+                ex *= decay
+                ey *= decay
+                bz *= decay
+
+            if cols > 1:
+                ex[:, 0] = ex[:, 1]
+                ex[:, -1] = ex[:, -2]
+                ey[:, 0] = ey[:, 1]
+                ey[:, -1] = ey[:, -2]
+                bz[:, 0] = bz[:, 1]
+                bz[:, -1] = bz[:, -2]
+            if rows > 1:
+                ex[0, :] = ex[1, :]
+                ex[-1, :] = ex[-2, :]
+                ey[0, :] = ey[1, :]
+                ey[-1, :] = ey[-2, :]
+                bz[0, :] = bz[1, :]
+                bz[-1, :] = bz[-2, :]
+
+            bz += np.float32(self.fluid_config.em_background_bz) * np.float32(0.0002)
+            bz[plasma_mask] += np.float32(self.fluid_config.em_background_bz) * np.float32(0.0010)
+
+        denom_sigma = np.maximum(sigma, np.float32(1.0e-6))
+        joule = ((jx * jx + jy * jy) / denom_sigma).astype(np.float32)
+        joule *= (sigma > np.float32(1.0e-6)).astype(np.float32)
+        joule = np.clip(np.nan_to_num(joule, nan=0.0, posinf=float(f_clip), neginf=0.0), 0.0, f_clip)
+
+        self.em_ex = ex
+        self.em_ey = ey
+        self.em_bz = bz
+        self.current_x = jx
+        self.current_y = jy
+        self.joule_heating_source = joule
+        self.em_solver_stats = {
+            "enabled": True,
+            "substeps": int(n_sub),
+            "dt_sub": float(dt_sub),
+            "current_rms": float(np.sqrt(np.mean((jx * jx + jy * jy).astype(np.float32)))) if jx.size else 0.0,
+        }
+
+    def _apply_mhd_lorentz_force(self, solid_mask, rho_ref, plasma_mask):
+        if not bool(self.fluid_config.mhd_lorentz_enabled):
+            return
+
+        dt_over_rho = np.float32(PHYSICS.dt / max(1.0e-6, rho_ref))
+        l_scale = np.float32(max(0.0, float(self.fluid_config.mhd_lorentz_scale)))
+        rows, cols = self.em_bz.shape if isinstance(self.em_bz, np.ndarray) else (0, 0)
+        fx = (self.current_y * self.em_bz).astype(np.float32)
+        fy = (-self.current_x * self.em_bz).astype(np.float32)
+        fx = np.clip(np.nan_to_num(fx, nan=0.0, posinf=200.0, neginf=-200.0), -200.0, 200.0)
+        fy = np.clip(np.nan_to_num(fy, nan=0.0, posinf=200.0, neginf=-200.0), -200.0, 200.0)
+
+        if bool(self.fluid_config.plasma_confinement_enabled):
+            conf_scale = np.float32(max(0.0, float(self.fluid_config.plasma_confinement_scale)))
+            b2 = (self.em_bz * self.em_bz).astype(np.float32)
+            grad_b2_x = self._get_work_buffer("mhd_grad_x", (rows, cols), np.float32)
+            grad_b2_y = self._get_work_buffer("mhd_grad_y", (rows, cols), np.float32)
+            _grad_xy_numba(b2, grad_b2_x, grad_b2_y, np.float32(PHYSICS.dx_inv), np.float32(PHYSICS.dy_inv))
+            fx[plasma_mask] -= conf_scale * grad_b2_x[plasma_mask]
+            fy[plasma_mask] -= conf_scale * grad_b2_y[plasma_mask]
+
+        self.vel_x += dt_over_rho * l_scale * fx
+        self.vel_y += dt_over_rho * l_scale * fy
+        self.vel_x = np.clip(np.nan_to_num(self.vel_x, nan=0.0, posinf=60.0, neginf=-60.0), -60.0, 60.0)
+        self.vel_y = np.clip(np.nan_to_num(self.vel_y, nan=0.0, posinf=60.0, neginf=-60.0), -60.0, 60.0)
+        self.vel_x[solid_mask] = 0.0
+        self.vel_y[solid_mask] = 0.0
+
+    def _apply_joule_heating_source(self, grid, rows, cols):
+        if not bool(self.fluid_config.mhd_joule_heating_enabled):
+            return
+        if not (isinstance(self.temperature, np.ndarray) and self.temperature.shape == (rows, cols)):
+            return
+        if not (isinstance(self.joule_heating_source, np.ndarray) and self.joule_heating_source.shape == (rows, cols)):
+            return
+
+        q_scale = np.float32(max(0.0, float(self.fluid_config.mhd_joule_heating_scale)))
+        if q_scale <= 0.0:
+            return
+
+        cp = np.full((rows, cols), np.float32(1.0), dtype=np.float32)
+        grid_np = np.asarray(grid, dtype=np.int32)
+        for mat_id, mat_data in self.materials.items():
+            mask = (grid_np == int(mat_id))
+            if not np.any(mask):
+                continue
+            cp_val = np.float32(max(0.1, float(self._mat_value(mat_data, "thermal_capacity", 1.0))))
+            cp[mask] = cp_val
+
+        dT = (self.joule_heating_source * q_scale * np.float32(PHYSICS.dt) / cp).astype(np.float32)
+        dT = np.clip(np.nan_to_num(dT, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
+        self.temperature += dT
 
     def _apply_mac_boundaries(self, solid_mask):
         """Apply no-slip velocity boundary and solid-face blocking on MAC faces."""
@@ -767,38 +1524,22 @@ class PowderPhysicsEngine:
         eta = np.clip((np.float32(thickness) - d_edge) / np.float32(thickness), 0.0, 1.0).astype(np.float32)
         sigma = (pml_strength * (eta ** pml_power)).astype(np.float32)
 
-        for _ in range(n_sub):
-            p_l = np.empty_like(p)
-            p_r = np.empty_like(p)
-            p_t = np.empty_like(p)
-            p_b = np.empty_like(p)
-            p_l[:, 0] = p[:, 0]
-            p_l[:, 1:] = p[:, :-1]
-            p_r[:, -1] = p[:, -1]
-            p_r[:, :-1] = p[:, 1:]
-            p_t[0, :] = p[0, :]
-            p_t[1:, :] = p[:-1, :]
-            p_b[-1, :] = p[-1, :]
-            p_b[:-1, :] = p[1:, :]
+        grad_px = self._get_work_buffer("acoustic_grad_px", (rows, cols), np.float32)
+        grad_py = self._get_work_buffer("acoustic_grad_py", (rows, cols), np.float32)
+        grad_u_x = self._get_work_buffer("acoustic_grad_ux", (rows, cols), np.float32)
+        grad_u_y = self._get_work_buffer("acoustic_grad_uy", (rows, cols), np.float32)
+        grad_v_x = self._get_work_buffer("acoustic_grad_vx", (rows, cols), np.float32)
+        grad_v_y = self._get_work_buffer("acoustic_grad_vy", (rows, cols), np.float32)
+        div_uv = self._get_work_buffer("acoustic_div", (rows, cols), np.float32)
 
-            grad_px = np.float32(0.5) * (p_r - p_l) * dx_inv
-            grad_py = np.float32(0.5) * (p_b - p_t) * dy_inv
+        for _ in range(n_sub):
+            _grad_xy_numba(p, grad_px, grad_py, dx_inv, dy_inv)
             u -= (dt_sub / rho) * grad_px
             v -= (dt_sub / rho) * grad_py
 
-            u_l = np.empty_like(u)
-            u_r = np.empty_like(u)
-            v_t = np.empty_like(v)
-            v_b = np.empty_like(v)
-            u_l[:, 0] = u[:, 0]
-            u_l[:, 1:] = u[:, :-1]
-            u_r[:, -1] = u[:, -1]
-            u_r[:, :-1] = u[:, 1:]
-            v_t[0, :] = v[0, :]
-            v_t[1:, :] = v[:-1, :]
-            v_b[-1, :] = v[-1, :]
-            v_b[:-1, :] = v[1:, :]
-            div_uv = np.float32(0.5) * ((u_r - u_l) * dx_inv + (v_b - v_t) * dy_inv)
+            _grad_xy_numba(u, grad_u_x, grad_u_y, dx_inv, dy_inv)
+            _grad_xy_numba(v, grad_v_x, grad_v_y, dx_inv, dy_inv)
+            div_uv[:] = np.float32(0.5) * (grad_u_x + grad_v_y)
             p -= (rho * c * c * dt_sub) * div_uv
 
             damp = np.exp(-sigma * dt_sub).astype(np.float32)
@@ -825,54 +1566,23 @@ class PowderPhysicsEngine:
         if self.pressure_pde.shape != (rows, cols):
             return
 
-        p = self.pressure_pde.astype(np.float32)
-        p_l = np.empty_like(p)
-        p_r = np.empty_like(p)
-        p_t = np.empty_like(p)
-        p_b = np.empty_like(p)
-        p_l[:, 0] = p[:, 0]
-        p_l[:, 1:] = p[:, :-1]
-        p_r[:, -1] = p[:, -1]
-        p_r[:, :-1] = p[:, 1:]
-        p_t[0, :] = p[0, :]
-        p_t[1:, :] = p[:-1, :]
-        p_b[-1, :] = p[-1, :]
-        p_b[:-1, :] = p[1:, :]
-        grad_p = np.sqrt((np.float32(0.5) * (p_r - p_l) * np.float32(PHYSICS.dx_inv)) ** 2 +
-                         (np.float32(0.5) * (p_b - p_t) * np.float32(PHYSICS.dy_inv)) ** 2).astype(np.float32)
+        p = np.asarray(self.pressure_pde, dtype=np.float32)
+        grad_px = self._get_work_buffer("shock_grad_px", (rows, cols), np.float32)
+        grad_py = self._get_work_buffer("shock_grad_py", (rows, cols), np.float32)
+        _grad_xy_numba(p, grad_px, grad_py, np.float32(PHYSICS.dx_inv), np.float32(PHYSICS.dy_inv))
+        grad_p = self._get_work_buffer("shock_grad_mag", (rows, cols), np.float32)
+        grad_p[:] = np.sqrt(grad_px * grad_px + grad_py * grad_py)
 
-        u = self.vel_x.astype(np.float32)
-        v = self.vel_y.astype(np.float32)
-        u_l = np.empty_like(u)
-        u_r = np.empty_like(u)
-        u_t = np.empty_like(u)
-        u_b = np.empty_like(u)
-        v_l = np.empty_like(v)
-        v_r = np.empty_like(v)
-        v_t = np.empty_like(v)
-        v_b = np.empty_like(v)
-        u_l[:, 0] = u[:, 0]
-        u_l[:, 1:] = u[:, :-1]
-        u_r[:, -1] = u[:, -1]
-        u_r[:, :-1] = u[:, 1:]
-        u_t[0, :] = u[0, :]
-        u_t[1:, :] = u[:-1, :]
-        u_b[-1, :] = u[-1, :]
-        u_b[:-1, :] = u[1:, :]
-        v_l[:, 0] = v[:, 0]
-        v_l[:, 1:] = v[:, :-1]
-        v_r[:, -1] = v[:, -1]
-        v_r[:, :-1] = v[:, 1:]
-        v_t[0, :] = v[0, :]
-        v_t[1:, :] = v[:-1, :]
-        v_b[-1, :] = v[-1, :]
-        v_b[:-1, :] = v[1:, :]
-
-        du_dx = np.float32(0.5) * (u_r - u_l) * np.float32(PHYSICS.dx_inv)
-        dv_dy = np.float32(0.5) * (v_b - v_t) * np.float32(PHYSICS.dy_inv)
-        du_dy = np.float32(0.5) * (u_b - u_t) * np.float32(PHYSICS.dy_inv)
-        dv_dx = np.float32(0.5) * (v_r - v_l) * np.float32(PHYSICS.dx_inv)
-        shear_rate = np.sqrt((du_dx - dv_dy) ** 2 + (du_dy + dv_dx) ** 2).astype(np.float32)
+        u = np.asarray(self.vel_x, dtype=np.float32)
+        v = np.asarray(self.vel_y, dtype=np.float32)
+        grad_u_x = self._get_work_buffer("shock_grad_ux", (rows, cols), np.float32)
+        grad_u_y = self._get_work_buffer("shock_grad_uy", (rows, cols), np.float32)
+        grad_v_x = self._get_work_buffer("shock_grad_vx", (rows, cols), np.float32)
+        grad_v_y = self._get_work_buffer("shock_grad_vy", (rows, cols), np.float32)
+        _grad_xy_numba(u, grad_u_x, grad_u_y, np.float32(PHYSICS.dx_inv), np.float32(PHYSICS.dy_inv))
+        _grad_xy_numba(v, grad_v_x, grad_v_y, np.float32(PHYSICS.dx_inv), np.float32(PHYSICS.dy_inv))
+        shear_rate = self._get_work_buffer("shock_shear", (rows, cols), np.float32)
+        _shear_rate_kernel(grad_u_x, grad_u_y, grad_v_x, grad_v_y, shear_rate)
 
         grad_w = np.float32(max(0.0, self.fluid_config.shock_pressure_gradient_weight))
         shear_w = np.float32(max(0.0, self.fluid_config.shock_shear_weight))
@@ -1022,24 +1732,12 @@ class PowderPhysicsEngine:
         dy2_c = np.float32((2.0 * PHYSICS.dy) * (2.0 * PHYSICS.dy))
         denom_c = np.float32(2.0 * (dx2_c + dy2_c))
         smooth_iters = int(max(1, self.fluid_config.pde_multigrid_presmooth + self.fluid_config.pde_multigrid_postsmooth))
+        active_c = ~solid_c
+        p_tmp = self._get_work_buffer("mg_p_tmp", p_c.shape, np.float32)
 
         for _ in range(smooth_iters):
-            p_l = np.empty_like(p_c)
-            p_r = np.empty_like(p_c)
-            p_t = np.empty_like(p_c)
-            p_b = np.empty_like(p_c)
-            p_l[:, 0] = p_c[:, 0]
-            p_l[:, 1:] = p_c[:, :-1]
-            p_r[:, -1] = p_c[:, -1]
-            p_r[:, :-1] = p_c[:, 1:]
-            p_t[0, :] = p_c[0, :]
-            p_t[1:, :] = p_c[:-1, :]
-            p_b[-1, :] = p_c[-1, :]
-            p_b[:-1, :] = p_c[1:, :]
-
-            p_new = (((p_l + p_r) * dy2_c + (p_t + p_b) * dx2_c - rhs_c * dx2_c * dy2_c) / denom_c).astype(np.float32)
-            p_new[solid_c] = 0.0
-            p_c = p_new
+            _pressure_jacobi_step_numba(p_c, rhs_c, active_c, solid_c, dx2_c, dy2_c, denom_c, p_tmp)
+            p_c, p_tmp = p_tmp, p_c
 
         p_prolong = np.repeat(np.repeat(p_c, 2, axis=0), 2, axis=1).astype(np.float32)
         p_out = p.copy()
@@ -1088,26 +1786,11 @@ class PowderPhysicsEngine:
         else:
             rhs_scale = np.sqrt(np.mean((rhs[active] ** 2).astype(np.float32))) if np.any(active) else np.float32(1.0)
             rhs_scale = np.float32(max(float(rhs_scale), 1.0e-12))
+            p_new = self._get_work_buffer("jacobi_p_new", p.shape, np.float32)
+            lap = self._get_work_buffer("jacobi_lap", p.shape, np.float32)
 
             for it in range(iter_cap):
-                p_l = np.empty_like(p)
-                p_r = np.empty_like(p)
-                p_t = np.empty_like(p)
-                p_b = np.empty_like(p)
-                p_l[:, 0] = p[:, 0]
-                p_l[:, 1:] = p[:, :-1]
-                p_r[:, -1] = p[:, -1]
-                p_r[:, :-1] = p[:, 1:]
-                p_t[0, :] = p[0, :]
-                p_t[1:, :] = p[:-1, :]
-                p_b[-1, :] = p[-1, :]
-                p_b[:-1, :] = p[1:, :]
-
-                p_new = p.copy()
-                update = (((p_l + p_r) * dy2 + (p_t + p_b) * dx2 - rhs * dx2 * dy2) / denom).astype(np.float32)
-                p_new[active] = update[active]
-                p_new[~active] = 0.0
-                p_new[solid_mask] = 0.0
+                _pressure_jacobi_step_numba(p, rhs, active, solid_mask, dx2, dy2, denom, p_new)
 
                 if btype in (BoundaryConditionType.OPEN, BoundaryConditionType.OUTLET):
                     if p_new.shape[1] > 1:
@@ -1128,27 +1811,14 @@ class PowderPhysicsEngine:
                     air_mask = (self.density_field <= np.float32(PHYSICS.rho_air * 1.05))
                     p_new[air_mask] *= np.float32(0.25)
 
-                p_l_n = np.empty_like(p_new)
-                p_r_n = np.empty_like(p_new)
-                p_t_n = np.empty_like(p_new)
-                p_b_n = np.empty_like(p_new)
-                p_l_n[:, 0] = p_new[:, 0]
-                p_l_n[:, 1:] = p_new[:, :-1]
-                p_r_n[:, -1] = p_new[:, -1]
-                p_r_n[:, :-1] = p_new[:, 1:]
-                p_t_n[0, :] = p_new[0, :]
-                p_t_n[1:, :] = p_new[:-1, :]
-                p_b_n[-1, :] = p_new[-1, :]
-                p_b_n[:-1, :] = p_new[1:, :]
-
                 if np.any(active):
-                    lap = (((p_l_n - 2.0 * p_new + p_r_n) / dx2) + ((p_t_n - 2.0 * p_new + p_b_n) / dy2)).astype(np.float32)
+                    _laplacian_aniso_numba(p_new, lap, dx2, dy2)
                     rr = (lap - rhs)[active]
                     residual = np.float32(np.sqrt(np.mean(rr * rr)) / rhs_scale)
                 else:
                     residual = np.float32(0.0)
 
-                p = p_new
+                p, p_new = p_new, p
                 iters_used = it + 1
                 if iters_used >= min_iters and residual <= residual_tol:
                     break
@@ -1256,35 +1926,14 @@ class PowderPhysicsEngine:
         v0 = self.vel_y.astype(np.float32, copy=True)
         u = u0.copy()
         v = v0.copy()
+        lap_u = self._get_work_buffer("visc_lap_u", u.shape, np.float32)
+        lap_v = self._get_work_buffer("visc_lap_v", v.shape, np.float32)
 
         for _ in range(iters):
-            u_l = np.empty_like(u)
-            u_r = np.empty_like(u)
-            u_t = np.empty_like(u)
-            u_b = np.empty_like(u)
-            u_l[:, 0] = u[:, 0]
-            u_l[:, 1:] = u[:, :-1]
-            u_r[:, -1] = u[:, -1]
-            u_r[:, :-1] = u[:, 1:]
-            u_t[0, :] = u[0, :]
-            u_t[1:, :] = u[:-1, :]
-            u_b[-1, :] = u[-1, :]
-            u_b[:-1, :] = u[1:, :]
-            u = (u0 + a * (u_l + u_r + u_t + u_b)) * inv_beta
-
-            v_l = np.empty_like(v)
-            v_r = np.empty_like(v)
-            v_t = np.empty_like(v)
-            v_b = np.empty_like(v)
-            v_l[:, 0] = v[:, 0]
-            v_l[:, 1:] = v[:, :-1]
-            v_r[:, -1] = v[:, -1]
-            v_r[:, :-1] = v[:, 1:]
-            v_t[0, :] = v[0, :]
-            v_t[1:, :] = v[:-1, :]
-            v_b[-1, :] = v[-1, :]
-            v_b[:-1, :] = v[1:, :]
-            v = (v0 + a * (v_l + v_r + v_t + v_b)) * inv_beta
+            _laplacian_5pt_numba(u, lap_u)
+            _laplacian_5pt_numba(v, lap_v)
+            u = (u0 + a * (lap_u + np.float32(4.0) * u)) * inv_beta
+            v = (v0 + a * (lap_v + np.float32(4.0) * v)) * inv_beta
 
             u[solid_mask] = 0.0
             v[solid_mask] = 0.0
@@ -1319,38 +1968,21 @@ class PowderPhysicsEngine:
 
         u = self.vel_x.astype(np.float32)
         v = self.vel_y.astype(np.float32)
+        dv_dx = self._get_work_buffer("vort_dv_dx", u.shape, np.float32)
+        dv_dy = self._get_work_buffer("vort_dv_dy", u.shape, np.float32)
+        du_dx = self._get_work_buffer("vort_du_dx", u.shape, np.float32)
+        du_dy = self._get_work_buffer("vort_du_dy", u.shape, np.float32)
+        _grad_xy_numba(v, dv_dx, dv_dy, dx_inv, dy_inv)
+        _grad_xy_numba(u, du_dx, du_dy, dx_inv, dy_inv)
 
-        v_l = np.empty_like(v)
-        v_r = np.empty_like(v)
-        u_t = np.empty_like(u)
-        u_b = np.empty_like(u)
-        v_l[:, 0] = v[:, 0]
-        v_l[:, 1:] = v[:, :-1]
-        v_r[:, -1] = v[:, -1]
-        v_r[:, :-1] = v[:, 1:]
-        u_t[0, :] = u[0, :]
-        u_t[1:, :] = u[:-1, :]
-        u_b[-1, :] = u[-1, :]
-        u_b[:-1, :] = u[1:, :]
+        omega = self._get_work_buffer("vort_omega", u.shape, np.float32)
+        omega[:] = np.float32(0.5) * (dv_dx - du_dy)
+        omega_abs = self._get_work_buffer("vort_omega_abs", u.shape, np.float32)
+        omega_abs[:] = np.abs(omega)
 
-        omega = 0.5 * ((v_r - v_l) * dx_inv - (u_b - u_t) * dy_inv)
-        omega_abs = np.abs(omega)
-
-        w_l = np.empty_like(omega_abs)
-        w_r = np.empty_like(omega_abs)
-        w_t = np.empty_like(omega_abs)
-        w_b = np.empty_like(omega_abs)
-        w_l[:, 0] = omega_abs[:, 0]
-        w_l[:, 1:] = omega_abs[:, :-1]
-        w_r[:, -1] = omega_abs[:, -1]
-        w_r[:, :-1] = omega_abs[:, 1:]
-        w_t[0, :] = omega_abs[0, :]
-        w_t[1:, :] = omega_abs[:-1, :]
-        w_b[-1, :] = omega_abs[-1, :]
-        w_b[:-1, :] = omega_abs[1:, :]
-
-        grad_x = 0.5 * (w_r - w_l) * dx_inv
-        grad_y = 0.5 * (w_b - w_t) * dy_inv
+        grad_x = self._get_work_buffer("vort_grad_x", u.shape, np.float32)
+        grad_y = self._get_work_buffer("vort_grad_y", u.shape, np.float32)
+        _grad_xy_numba(omega_abs, grad_x, grad_y, dx_inv, dy_inv)
         grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y) + np.float32(1e-6)
 
         n_x = grad_x / grad_mag
@@ -1407,8 +2039,10 @@ class PowderPhysicsEngine:
 
         self._ensure_pde_state(rows, cols)
         self._ensure_thermal_state(rows, cols)
+        grid_np = np.asarray(grid, dtype=np.int32)
 
         solid_mask, nu_field, _, _ = self._rebuild_density_and_solid_masks(grid, rows, cols)
+        _, _, plasma_mask = self._build_em_material_fields(grid_np, rows, cols)
         active_density = self.density_field[~solid_mask]
         rho_ref = float(np.mean(active_density)) if active_density.size else float(PHYSICS.rho_air)
         nu_scalar = float(np.mean(nu_field[~solid_mask])) if np.any(~solid_mask) else float(self.fluid_config.pde_kinematic_viscosity)
@@ -1423,6 +2057,8 @@ class PowderPhysicsEngine:
         self._apply_buoyancy_force(solid_mask, rho_ref)
         self._apply_vorticity_confinement(solid_mask)
         self._apply_porous_drag(solid_mask, rho_ref)
+        self._update_em_fdtd(grid_np, rows, cols)
+        self._apply_mhd_lorentz_force(solid_mask, rho_ref, plasma_mask)
         self._apply_acoustic_substep_with_pml(solid_mask, rho_ref)
 
         # Implicit viscosity (Jacobi)
@@ -1462,6 +2098,9 @@ class PowderPhysicsEngine:
             "pressure_residual": float(self.pressure_solver_stats.get("residual", 0.0)),
             "pressure_iterations": int(self.pressure_solver_stats.get("iterations", 0)),
             "pressure_active_fraction": float(self.pressure_solver_stats.get("active_fraction", 0.0)),
+            "current_rms": float(np.sqrt(np.mean((self.current_x * self.current_x + self.current_y * self.current_y).astype(np.float32)))) if self.current_x.size else 0.0,
+            "magnetic_energy": float(np.mean((self.em_bz * self.em_bz).astype(np.float32))) if self.em_bz.size else 0.0,
+            "joule_mean": float(np.mean(self.joule_heating_source.astype(np.float32))) if self.joule_heating_source.size else 0.0,
             "pde_stage_ms": float((time.perf_counter() - pde_start) * 1000.0),
         }
 
@@ -1482,6 +2121,19 @@ class PowderPhysicsEngine:
         self.soot_number_density[row][col] = np.float32(0.0)
         self.catalyst_theta_fuel[row][col] = np.float32(0.0)
         self.catalyst_theta_o2[row][col] = np.float32(0.0)
+        # Reset structural state for freshly converted cells so they don't inherit
+        # stale stress/damage from the previous phase.
+        if isinstance(self.disp_x, np.ndarray) and self.disp_x.shape == self.integrity.shape:
+            self.disp_x[row][col] = np.float32(0.0)
+            self.disp_y[row][col] = np.float32(0.0)
+            self.struct_vel_x[row][col] = np.float32(0.0)
+            self.struct_vel_y[row][col] = np.float32(0.0)
+            self.sigma_xx[row][col] = np.float32(0.0)
+            self.sigma_yy[row][col] = np.float32(0.0)
+            self.tau_xy[row][col] = np.float32(0.0)
+            self.plastic_strain[row][col] = np.float32(0.0)
+            self.damage_field[row][col] = np.float32(0.0)
+            self.pore_pressure[row][col] = np.float32(0.0)
         mat_data = self._get(new_mat)
         acid_strength = np.float32(max(0.0, float(self._mat_value(mat_data, "acid_strength", 0.0))))
         base_strength = np.float32(max(0.0, float(self._mat_value(mat_data, "base_strength", 0.0))))
@@ -1506,6 +2158,7 @@ class PowderPhysicsEngine:
         self._ensure_thermal_state(rows, cols)
         self._ensure_fluid_state(rows, cols)
         self._ensure_chemical_state(grid, rows, cols)
+        self._ensure_structural_state(rows, cols)
 
         mat_data = self._get(mat_id)
         initial_temp = self._mat_value(mat_data, "initial_temp", None)
@@ -1525,6 +2178,16 @@ class PowderPhysicsEngine:
         self.soot_number_density[row][col] = np.float32(0.0)
         self.catalyst_theta_fuel[row][col] = np.float32(0.0)
         self.catalyst_theta_o2[row][col] = np.float32(0.0)
+        self.disp_x[row][col] = np.float32(0.0)
+        self.disp_y[row][col] = np.float32(0.0)
+        self.struct_vel_x[row][col] = np.float32(0.0)
+        self.struct_vel_y[row][col] = np.float32(0.0)
+        self.sigma_xx[row][col] = np.float32(0.0)
+        self.sigma_yy[row][col] = np.float32(0.0)
+        self.tau_xy[row][col] = np.float32(0.0)
+        self.plastic_strain[row][col] = np.float32(0.0)
+        self.damage_field[row][col] = np.float32(0.0)
+        self.pore_pressure[row][col] = np.float32(0.0)
 
         acid_strength = np.float32(max(0.0, float(self._mat_value(mat_data, "acid_strength", 0.0))))
         base_strength = np.float32(max(0.0, float(self._mat_value(mat_data, "base_strength", 0.0))))
@@ -2068,22 +2731,18 @@ class PowderPhysicsEngine:
 
         return out
 
+    def _get_work_buffer(self, key, shape, dtype):
+        buf = self.state.work_buffers.get(key)
+        if buf is None or buf.shape != shape or buf.dtype != dtype:
+            buf = np.zeros(shape, dtype=dtype)
+            self.state.work_buffers[key] = buf
+        return buf
+
     def _laplacian_5pt(self, field):
-        left = np.empty_like(field)
-        right = np.empty_like(field)
-        up = np.empty_like(field)
-        down = np.empty_like(field)
-
-        left[:, 0] = field[:, 0]
-        left[:, 1:] = field[:, :-1]
-        right[:, -1] = field[:, -1]
-        right[:, :-1] = field[:, 1:]
-        up[0, :] = field[0, :]
-        up[1:, :] = field[:-1, :]
-        down[-1, :] = field[-1, :]
-        down[:-1, :] = field[1:, :]
-
-        return (left + right + up + down - 4.0 * field).astype(np.float32)
+        field_f = np.asarray(field, dtype=np.float32)
+        out = self._get_work_buffer("laplacian", field_f.shape, np.float32)
+        _laplacian_5pt_numba(field_f, out)
+        return out
 
     def _build_structural_material_fields(self, grid_np, rows, cols):
         solid_mask = np.zeros((rows, cols), dtype=np.bool_)
@@ -2108,7 +2767,9 @@ class PowderPhysicsEngine:
             if not np.any(mask):
                 continue
             m_type = str(mat_data.get("type", "air"))
-            if m_type in ("solid", "powder"):
+            burn_rate = float(self._mat_value(mat_data, "burn_rate", 0.0))
+            is_combustible = burn_rate > 0.0
+            if m_type in ("solid", "powder") and (not is_combustible):
                 solid_mask[mask] = True
 
             rho[mask] = np.float32(max(1.0, float(self._mat_value(mat_data, "density", PHYSICS.rho_air))))
@@ -2129,7 +2790,7 @@ class PowderPhysicsEngine:
             deg_start[mask] = np.float32(start_val)
             deg_end[mask] = np.float32(end_val)
 
-            if bool(self._mat_value(mat_data, "is_brittle", m_type == "solid")):
+            if bool(self._mat_value(mat_data, "is_brittle", False)) and (not is_combustible):
                 brittle_mask[mask] = True
 
         return (
@@ -2143,6 +2804,11 @@ class PowderPhysicsEngine:
         if len(self.debris_particles) > 1200:
             return
 
+        vx0 = float(np.nan_to_num(local_vx, nan=0.0, posinf=0.0, neginf=0.0))
+        vy0 = float(np.nan_to_num(local_vy, nan=0.0, posinf=0.0, neginf=0.0))
+        vx0 = float(np.clip(vx0, -80.0, 80.0))
+        vy0 = float(np.clip(vy0, -80.0, 80.0))
+
         density = float(self._mat_value(self._get(mat_id), "density", 1200.0))
         radius = float(max(0.2, self.structural_config.debris_particle_radius_cells))
         area = math.pi * radius * radius
@@ -2150,8 +2816,8 @@ class PowderPhysicsEngine:
         self.debris_particles.append({
             "x": float(col) + 0.5,
             "y": float(row) + 0.5,
-            "vx": float(local_vx),
-            "vy": float(local_vy),
+            "vx": vx0,
+            "vy": vy0,
             "omega": float(np.random.uniform(-2.0, 2.0)),
             "radius": radius,
             "mass": mass,
@@ -2202,6 +2868,22 @@ class PowderPhysicsEngine:
 
         next_particles = []
         for p in self.debris_particles:
+            px = float(np.nan_to_num(p.get("x", 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+            py = float(np.nan_to_num(p.get("y", 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+            pvx = float(np.nan_to_num(p.get("vx", 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+            pvy = float(np.nan_to_num(p.get("vy", 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+            pm = float(np.nan_to_num(p.get("mass", 1.0), nan=1.0, posinf=1.0, neginf=1.0))
+            pr = float(np.nan_to_num(p.get("radius", 0.35), nan=0.35, posinf=0.35, neginf=0.35))
+            plife = float(np.nan_to_num(p.get("lifetime", 0.0), nan=0.0, posinf=0.0, neginf=0.0))
+
+            p["x"] = float(np.clip(px, -1.0e3, 1.0e3))
+            p["y"] = float(np.clip(py, -1.0e3, 1.0e3))
+            p["vx"] = float(np.clip(pvx, -200.0, 200.0))
+            p["vy"] = float(np.clip(pvy, -200.0, 200.0))
+            p["mass"] = float(max(1.0e-3, min(1.0e6, pm)))
+            p["radius"] = float(np.clip(pr, 0.05, 3.0))
+            p["lifetime"] = float(np.clip(plife, -1.0, 120.0))
+
             cx = int(np.clip(round(p["x"]), 0, cols - 1))
             cy = int(np.clip(round(p["y"]), 0, rows - 1))
 
@@ -2215,11 +2897,33 @@ class PowderPhysicsEngine:
                 self.vel_x[cy, cx] -= np.float32(coupling * p["vx"])
                 self.vel_y[cy, cx] -= np.float32(coupling * p["vy"])
 
+            if bool(self.fluid_config.railgun_enabled) and self.current_x.shape == (rows, cols) and self.em_bz.shape == (rows, cols):
+                jx = float(self.current_x[cy, cx])
+                jy = float(self.current_y[cy, cx])
+                bz = float(self.em_bz[cy, cx])
+                fx = jy * bz
+                fy = -jx * bz
+                mat_data = self._get(int(p.get("mat", 0))) if int(p.get("mat", 0)) in self.materials else None
+                sigma_e = float(self._mat_value(mat_data, "electrical_conductivity", 0.0)) if mat_data is not None else 0.0
+                if sigma_e > 0.0:
+                    force_scale = float(max(0.0, self.fluid_config.railgun_debris_force_scale))
+                    inv_m = 1.0 / max(1e-6, p["mass"])
+                    accel_x = float(np.clip(force_scale * fx * sigma_e * inv_m, -120.0, 120.0))
+                    accel_y = float(np.clip(force_scale * fy * sigma_e * inv_m, -120.0, 120.0))
+                    p["vx"] += accel_x * dt
+                    p["vy"] += accel_y * dt
+
             p["vx"] += gx
             p["vy"] += gy
             p["x"] += p["vx"] * dt
             p["y"] += p["vy"] * dt
             p["lifetime"] -= dt
+
+            p["vx"] = float(np.clip(np.nan_to_num(p["vx"], nan=0.0, posinf=200.0, neginf=-200.0), -200.0, 200.0))
+            p["vy"] = float(np.clip(np.nan_to_num(p["vy"], nan=0.0, posinf=200.0, neginf=-200.0), -200.0, 200.0))
+            p["x"] = float(np.nan_to_num(p["x"], nan=float(cx), posinf=float(cols - 1), neginf=0.0))
+            p["y"] = float(np.nan_to_num(p["y"], nan=float(cy), posinf=float(rows - 1), neginf=0.0))
+            p["lifetime"] = float(np.nan_to_num(p["lifetime"], nan=0.0, posinf=0.0, neginf=0.0))
 
             # Domain bounce
             if p["x"] < p["radius"]:
@@ -2280,166 +2984,71 @@ class PowderPhysicsEngine:
         damping = np.float32(np.clip(self.structural_config.damping, 0.0, 0.99))
         grav = np.float32(self.structural_config.gravity_coupling * PHYSICS.g)
 
-        for _ in range(max(1, int(self.structural_config.explicit_substeps))):
-            ux = self.disp_x
-            uy = self.disp_y
-
-            ux_l = np.empty_like(ux)
-            ux_r = np.empty_like(ux)
-            ux_t = np.empty_like(ux)
-            ux_b = np.empty_like(ux)
-            uy_l = np.empty_like(uy)
-            uy_r = np.empty_like(uy)
-            uy_t = np.empty_like(uy)
-            uy_b = np.empty_like(uy)
-
-            ux_l[:, 0] = ux[:, 0]
-            ux_l[:, 1:] = ux[:, :-1]
-            ux_r[:, -1] = ux[:, -1]
-            ux_r[:, :-1] = ux[:, 1:]
-            ux_t[0, :] = ux[0, :]
-            ux_t[1:, :] = ux[:-1, :]
-            ux_b[-1, :] = ux[-1, :]
-            ux_b[:-1, :] = ux[1:, :]
-
-            uy_l[:, 0] = uy[:, 0]
-            uy_l[:, 1:] = uy[:, :-1]
-            uy_r[:, -1] = uy[:, -1]
-            uy_r[:, :-1] = uy[:, 1:]
-            uy_t[0, :] = uy[0, :]
-            uy_t[1:, :] = uy[:-1, :]
-            uy_b[-1, :] = uy[-1, :]
-            uy_b[:-1, :] = uy[1:, :]
-
-            eps_xx = np.float32(0.5) * (ux_r - ux_l) * dx_inv
-            eps_yy = np.float32(0.5) * (uy_b - uy_t) * dy_inv
-            eps_xy = np.float32(0.25) * ((ux_b - ux_t) * dy_inv + (uy_r - uy_l) * dx_inv)
-
-            if self.structural_config.thermal_strain_enabled:
-                eps_th = alpha * (self.temperature.astype(np.float32) - ambient)
-            else:
-                eps_th = np.zeros_like(eps_xx)
-
-            # Scalar plastic strain as isotropic part of inelastic strain.
-            eps_xx_eff = eps_xx - eps_th - self.plastic_strain
-            eps_yy_eff = eps_yy - eps_th - self.plastic_strain
-            tr_eps = eps_xx_eff + eps_yy_eff
-
-            if self.structural_config.thermal_degradation_enabled:
-                temp = self.temperature.astype(np.float32)
-                deg = np.clip((temp - deg_start) / np.maximum(np.float32(1.0), (deg_end - deg_start)), 0.0, 1.0)
-                strength_factor = 1.0 - np.float32(0.9) * deg
-            else:
-                strength_factor = np.ones_like(eps_xx_eff)
-
-            E_eff = young * strength_factor
-            nu_eff = np.clip(nu, 0.01, 0.49)
-            mu = E_eff / (2.0 * (1.0 + nu_eff))
-            lam = (E_eff * nu_eff) / np.maximum(np.float32(1e-6), (1.0 + nu_eff) * (1.0 - 2.0 * nu_eff))
-
-            sxx = (2.0 * mu * eps_xx_eff + lam * tr_eps).astype(np.float32)
-            syy = (2.0 * mu * eps_yy_eff + lam * tr_eps).astype(np.float32)
-            txy = (2.0 * mu * eps_xy).astype(np.float32)
-
-            if self.structural_config.neo_hookean_enabled:
-                clip = np.float32(max(0.05, self.structural_config.finite_strain_clip))
-                ex = np.clip(eps_xx, -clip, clip)
-                ey = np.clip(eps_yy, -clip, clip)
-                gxy = np.clip(eps_xy, -clip, clip)
-                J = np.clip((1.0 + ex) * (1.0 + ey) - gxy * gxy, 0.55, 1.8)
-                volumetric = (J - 1.0)
-                sxx += (2.0 * neo_c1 * ex + 2.0 * neo_d1 * volumetric).astype(np.float32)
-                syy += (2.0 * neo_c1 * ey + 2.0 * neo_d1 * volumetric).astype(np.float32)
-                txy += (2.0 * neo_c1 * gxy).astype(np.float32)
-
-            # Elastoplastic projection with von-Mises equivalent stress.
-            vm = np.sqrt(np.maximum(np.float32(0.0), sxx * sxx - sxx * syy + syy * syy + np.float32(3.0) * txy * txy)).astype(np.float32)
-            yield_eff = sigma_y * strength_factor
-            if self.structural_config.elastoplastic_enabled:
-                over = vm > yield_eff
-                scale = np.ones_like(vm)
-                scale[over] = np.clip(yield_eff[over] / np.maximum(vm[over], np.float32(1e-6)), 0.05, 1.0)
-                sxx *= scale
-                syy *= scale
-                txy *= scale
-                self.plastic_strain[over] = np.clip(
-                    self.plastic_strain[over] + (1.0 - scale[over]) * (np.float32(0.015) + hardening[over]),
-                    0.0,
-                    0.5,
-                )
-
-            self.sigma_xx = sxx
-            self.sigma_yy = syy
-            self.tau_xy = txy
-
-            # Structural dynamics: ρ * u_tt = div(σ) + ρ g
-            sxx_l = np.empty_like(sxx)
-            sxx_r = np.empty_like(sxx)
-            syy_t = np.empty_like(syy)
-            syy_b = np.empty_like(syy)
-            txy_l = np.empty_like(txy)
-            txy_r = np.empty_like(txy)
-            txy_t = np.empty_like(txy)
-            txy_b = np.empty_like(txy)
-
-            sxx_l[:, 0] = sxx[:, 0]
-            sxx_l[:, 1:] = sxx[:, :-1]
-            sxx_r[:, -1] = sxx[:, -1]
-            sxx_r[:, :-1] = sxx[:, 1:]
-            syy_t[0, :] = syy[0, :]
-            syy_t[1:, :] = syy[:-1, :]
-            syy_b[-1, :] = syy[-1, :]
-            syy_b[:-1, :] = syy[1:, :]
-
-            txy_l[:, 0] = txy[:, 0]
-            txy_l[:, 1:] = txy[:, :-1]
-            txy_r[:, -1] = txy[:, -1]
-            txy_r[:, :-1] = txy[:, 1:]
-            txy_t[0, :] = txy[0, :]
-            txy_t[1:, :] = txy[:-1, :]
-            txy_b[-1, :] = txy[-1, :]
-            txy_b[:-1, :] = txy[1:, :]
-
-            fx = np.float32(0.5) * ((sxx_r - sxx_l) * dx_inv + (txy_b - txy_t) * dy_inv)
-            fy = np.float32(0.5) * ((txy_r - txy_l) * dx_inv + (syy_b - syy_t) * dy_inv) + rho * grav
-
-            inv_rho = 1.0 / np.maximum(np.float32(1.0), rho)
-            self.struct_vel_x += dt_sub * fx * inv_rho
-            self.struct_vel_y += dt_sub * fy * inv_rho
-            self.struct_vel_x *= (1.0 - damping)
-            self.struct_vel_y *= (1.0 - damping)
-
-            self.struct_vel_x[~solid_mask] = 0.0
-            self.struct_vel_y[~solid_mask] = 0.0
-            self.disp_x += dt_sub * self.struct_vel_x
-            self.disp_y += dt_sub * self.struct_vel_y
-            self.disp_x[~solid_mask] = 0.0
-            self.disp_y[~solid_mask] = 0.0
+        substeps = max(1, int(self.structural_config.explicit_substeps))
+        temp_f = np.asarray(self.temperature, dtype=np.float32)
+        sigma_xx_new = self._get_work_buffer("sigma_xx_new", (rows, cols), np.float32)
+        sigma_yy_new = self._get_work_buffer("sigma_yy_new", (rows, cols), np.float32)
+        tau_xy_new = self._get_work_buffer("tau_xy_new", (rows, cols), np.float32)
+        for _ in range(substeps):
+            _structural_constitutive_kernel(
+                self.disp_x,
+                self.disp_y,
+                self.plastic_strain,
+                temp_f,
+                solid_mask,
+                young,
+                nu,
+                alpha,
+                sigma_y,
+                neo_c1,
+                neo_d1,
+                hardening,
+                deg_start,
+                deg_end,
+                dx_inv,
+                dy_inv,
+                ambient,
+                self.structural_config.thermal_strain_enabled,
+                self.structural_config.thermal_degradation_enabled,
+                self.structural_config.neo_hookean_enabled,
+                self.structural_config.elastoplastic_enabled,
+                np.float32(max(0.05, self.structural_config.finite_strain_clip)),
+                sigma_xx_new,
+                sigma_yy_new,
+                tau_xy_new,
+            )
+            _structural_dynamics_kernel(
+                self.disp_x,
+                self.disp_y,
+                self.struct_vel_x,
+                self.struct_vel_y,
+                self.sigma_xx,
+                self.sigma_yy,
+                self.tau_xy,
+                sigma_xx_new,
+                sigma_yy_new,
+                tau_xy_new,
+                solid_mask,
+                rho,
+                dt_sub,
+                dx_inv,
+                dy_inv,
+                damping,
+                grav,
+            )
 
         # Thermomechanical spalling driver: |∇T| + pore pressure on boundary solids.
-        temp = self.temperature.astype(np.float32)
-        t_l = np.empty_like(temp)
-        t_r = np.empty_like(temp)
-        t_t = np.empty_like(temp)
-        t_b = np.empty_like(temp)
-        t_l[:, 0] = temp[:, 0]
-        t_l[:, 1:] = temp[:, :-1]
-        t_r[:, -1] = temp[:, -1]
-        t_r[:, :-1] = temp[:, 1:]
-        t_t[0, :] = temp[0, :]
-        t_t[1:, :] = temp[:-1, :]
-        t_b[-1, :] = temp[-1, :]
-        t_b[:-1, :] = temp[1:, :]
-        grad_t = np.sqrt((np.float32(0.5) * (t_r - t_l) * dx_inv) ** 2 + (np.float32(0.5) * (t_b - t_t) * dy_inv) ** 2)
+        grad_t = self._get_work_buffer("grad_t", (rows, cols), np.float32)
+        _grad_mag_numba(temp_f, grad_t, dx_inv, dy_inv)
 
-        moist = self.moisture.astype(np.float32) if isinstance(self.moisture, np.ndarray) and self.moisture.shape == (rows, cols) else np.zeros((rows, cols), dtype=np.float32)
-        self.pore_pressure = (pore_coeff * moist * np.maximum(np.float32(0.0), temp - np.float32(100.0))).astype(np.float32)
+        if isinstance(self.moisture, np.ndarray) and self.moisture.shape == (rows, cols):
+            moist = np.asarray(self.moisture, dtype=np.float32)
+        else:
+            moist = self._get_work_buffer("moisture_fallback", (rows, cols), np.float32)
+            moist.fill(np.float32(0.0))
+        _pore_pressure_kernel(temp_f, moist, pore_coeff, self.pore_pressure)
 
         # Failures and conversion to debris particles.
-        friction_tan = np.tan(np.deg2rad(friction.astype(np.float32)))
-        vm = np.sqrt(np.maximum(np.float32(0.0), self.sigma_xx * self.sigma_xx - self.sigma_xx * self.sigma_yy + self.sigma_yy * self.sigma_yy + np.float32(3.0) * self.tau_xy * self.tau_xy))
-        normal = np.float32(0.5) * (self.sigma_xx + self.sigma_yy)
-        tau_max = np.sqrt(((self.sigma_xx - self.sigma_yy) * np.float32(0.5)) ** 2 + self.tau_xy * self.tau_xy)
         spall_threshold = np.float32(max(1.0, self.structural_config.spalling_temperature_gradient_threshold))
 
         for row in range(rows):
@@ -2450,22 +3059,36 @@ class PowderPhysicsEngine:
                 mat = grid[row][col]
                 mat_data = self._get(mat)
                 is_brittle = bool(brittle_mask[row, col])
+                is_combustible = self._is_combustible(mat_data)
                 fail = False
 
+                sxx = float(self.sigma_xx[row, col])
+                syy = float(self.sigma_yy[row, col])
+                txy = float(self.tau_xy[row, col])
+                vm = math.sqrt(max(0.0, sxx * sxx - sxx * syy + syy * syy + 3.0 * txy * txy))
+                normal = 0.5 * (sxx + syy)
+                tau_max = math.sqrt(((sxx - syy) * 0.5) ** 2 + txy * txy)
+
                 if is_brittle and self.structural_config.brittle_mohr_coulomb_enabled:
-                    shear_limit = float(cohesion[row, col] + max(0.0, normal[row, col]) * friction_tan[row, col])
+                    friction_tan = math.tan(math.radians(float(friction[row, col])))
+                    shear_limit = float(cohesion[row, col] + max(0.0, normal) * friction_tan)
                     tensile_cut = float(self.structural_config.brittle_tension_cutoff)
-                    if float(tau_max[row, col]) > shear_limit or float(normal[row, col]) < -tensile_cut:
+                    if tau_max > shear_limit or normal < -tensile_cut:
                         fail = True
 
                 if not is_brittle:
                     yld = max(1.0, float(sigma_y[row, col]))
-                    if float(vm[row, col]) > yld:
-                        overload = (float(vm[row, col]) / yld) - 1.0
+                    if is_combustible:
+                        yld *= 25.0
+                    if vm > yld:
+                        overload = (vm / yld) - 1.0
+                        if is_combustible:
+                            overload *= 0.1
                         self.damage_field[row, col] = min(1.0, self.damage_field[row, col] + overload * self.structural_config.failure_damage_rate)
                         self.integrity[row, col] = max(0.0, self.integrity[row, col] - overload * self.structural_config.failure_damage_rate)
 
-                if self.structural_config.spalling_enabled:
+                spall_active = self.structural_config.spalling_enabled and is_brittle
+                if spall_active:
                     # Boundary-solid detection (at least one non-solid cardinal neighbor)
                     boundary = False
                     for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -2474,7 +3097,11 @@ class PowderPhysicsEngine:
                             boundary = True
                             break
                     if boundary:
-                        spall_drive = float(grad_t[row, col] / max(1.0, spall_threshold)) + float(self.structural_config.spalling_pore_pressure_weight * self.pore_pressure[row, col] / 1.0e3)
+                        # Convert gradient (°C/m) to per-cell ΔT to avoid overdriving damage at hot/cold interfaces.
+                        grad_delta = float(grad_t[row, col]) * float(PHYSICS.dx)
+                        spall_drive = (grad_delta / max(1.0, spall_threshold)) + float(self.structural_config.spalling_pore_pressure_weight * self.pore_pressure[row, col] / 1.0e3)
+                        if spall_drive < 0.0:
+                            spall_drive = 0.0
                         if spall_drive > 1.0:
                             self.damage_field[row, col] = min(1.0, self.damage_field[row, col] + (spall_drive - 1.0) * 0.08)
 
@@ -2486,7 +3113,8 @@ class PowderPhysicsEngine:
 
                 local_vx = float(self.struct_vel_x[row, col])
                 local_vy = float(self.struct_vel_y[row, col])
-                self._spawn_debris_particle(row, col, mat, local_vx, local_vy)
+                if not is_combustible:
+                    self._spawn_debris_particle(row, col, mat, local_vx, local_vy)
 
                 # Damage mechanics: reset stress tensor and convert failed cell.
                 self.sigma_xx[row, col] = 0.0
@@ -2499,9 +3127,13 @@ class PowderPhysicsEngine:
                 self.plastic_strain[row, col] = 0.0
                 self.damage_field[row, col] = 0.0
                 self.integrity[row, col] = 0.0
-                grid[row][col] = 0
+                if is_combustible:
+                    burnout = int(self._mat_value(mat_data, "burnout_product", self.material_ids.get("ash", 0)))
+                    grid[row][col] = burnout if burnout in self.materials else 0
+                else:
+                    grid[row][col] = 0
                 counters["changes"] += 1
-                events.append({"type": "structural_failure", "row": row, "col": col, "from": mat})
+                events.append({"type": "structural_failure", "row": row, "col": col, "from": mat, "combustible": bool(is_combustible)})
 
         self._update_debris_dem(grid, rows, cols, counters, events)
 
@@ -2769,20 +3401,8 @@ class PowderPhysicsEngine:
             return
 
         t = self.temperature.astype(np.float32)
-        up = np.empty_like(t)
-        down = np.empty_like(t)
-        left = np.empty_like(t)
-        right = np.empty_like(t)
-        up[0, :] = t[0, :]
-        up[1:, :] = t[:-1, :]
-        down[-1, :] = t[-1, :]
-        down[:-1, :] = t[1:, :]
-        left[:, 0] = t[:, 0]
-        left[:, 1:] = t[:, :-1]
-        right[:, -1] = t[:, -1]
-        right[:, :-1] = t[:, 1:]
-
-        neighbor_peak = np.maximum(np.maximum(up, down), np.maximum(left, right))
+        neighbor_peak = self._get_work_buffer("leidenfrost_neighbor_peak", t.shape, np.float32)
+        _neighbor_peak4_numba(t, neighbor_peak)
         film_mask = water_mask & (neighbor_peak >= np.float32(self.thermal_config.leidenfrost_temp))
         if not np.any(film_mask):
             return
@@ -2939,20 +3559,26 @@ class PowderPhysicsEngine:
                 # base output from a material property (overridable), plus lava bonus
                 heat_out = self._mat_value(mat_data, "contact_heat_output", 0.0)
                 if mat == lava_id:
-                    heat_out = max(heat_out, (src_temp - 300.0) * 0.004)
+                    heat_out = max(heat_out, (src_temp - 300.0) * 0.008)
                 # active flame cells radiate IR heat to all cardinal neighbours
                 if self.burn_stage[row][col] == 3:
                     flame_heat_out = max(0.0, (src_temp - 200.0) * 0.008)
                     heat_out = max(heat_out, flame_heat_out)
                 if heat_out <= 0.0:
                     continue
+                if mat == lava_id:
+                    bonus_cap = 42.0
+                elif self.burn_stage[row][col] == 3:
+                    bonus_cap = 30.0
+                else:
+                    bonus_cap = 18.0
                 for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     nr, nc = row + dr, col + dc
                     if not self._in_bounds(nr, nc, rows, cols):
                         continue
                     n_temp = self.temperature[nr][nc]
                     if src_temp > n_temp:
-                        bonus = min(18.0, (src_temp - n_temp) * heat_out)
+                        bonus = min(bonus_cap, (src_temp - n_temp) * heat_out)
                         self.temperature[nr][nc] += bonus
 
     def _update_ignition(self, grid, rows, cols, tick_index, rng, events):
@@ -2988,12 +3614,15 @@ class PowderPhysicsEngine:
 
                 has_flame_neighbor = self._neighbor_is_flaming(row, col, rows, cols)
                 has_hot_neighbor = self._neighbor_is_hot(row, col, rows, cols, eff_ignition_temp * 0.85)
+                temp_here = self.temperature[row][col]
 
-                can_ignite = self.temperature[row][col] >= eff_ignition_temp and (
+                can_ignite = temp_here >= eff_ignition_temp and (
                     has_flame_neighbor or has_hot_neighbor
                     or rng.random() < max(0.02, eff_spark_sens * 0.05)
                 )
-                if self.temperature[row][col] >= auto_ignite_temp and moisture < 0.1:
+                if (not can_ignite) and has_flame_neighbor and temp_here >= (eff_ignition_temp * 0.65):
+                    can_ignite = True
+                if temp_here >= auto_ignite_temp and moisture < 0.1:
                     can_ignite = True
 
                 if can_ignite:
@@ -3422,9 +4051,11 @@ class PowderPhysicsEngine:
     def _stage_thermal(self, grid, rows, cols, tick_index, rng, counters, events):
         self._ensure_thermal_state(rows, cols)
         self._ensure_chemical_state(grid, rows, cols)
+        self._ensure_pde_state(rows, cols)
         self._update_moisture_transport_phase3(grid, rows, cols)
         self._update_moisture(grid, rows, cols)
         self._update_thermal_field(grid, rows, cols)
+        self._apply_joule_heating_source(grid, rows, cols)
         self._apply_leidenfrost_evaporation(grid, rows, cols)
         self._update_water_cooling(grid, rows, cols)
         self._update_contact_heating(grid, rows, cols)
@@ -3561,89 +4192,59 @@ class PowderPhysicsEngine:
     def _update_phase6_stiff_kinetics_edc(self, rows, cols, mats, counters, events):
         if not self.chemistry_config.stiff_kinetics_enabled:
             return
+        if self.fuel_vapor.shape != (rows, cols) or self.oxygen_level.shape != (rows, cols):
+            return
 
         dt = np.float32(PHYSICS.dt)
         R = np.float32(self.chemistry_config.arrhenius_R)
-        T = np.clip(self.temperature.astype(np.float32), self.chemistry_config.arrhenius_temp_clamp_min, self.chemistry_config.arrhenius_temp_clamp_max)
-        fuel0 = np.clip(self.fuel_vapor.astype(np.float32), 0.0, 1.0)
-        o20 = np.clip(self.oxygen_level.astype(np.float32), 0.0, 1.0)
-        stoich = mats["stoich"]
-
-        A = mats["A"]
-        Ea = mats["Ea"]
-        ord_f = mats["ord_f"]
-        ord_o = mats["ord_o"]
-        k_arr = A * np.exp(-Ea / np.maximum(np.float32(1e-6), (R * T)))
-
-        if self.vel_x.shape == (rows, cols):
-            u = self.vel_x.astype(np.float32)
-            v = self.vel_y.astype(np.float32)
-            u_l = np.empty_like(u); u_r = np.empty_like(u); u_t = np.empty_like(u); u_b = np.empty_like(u)
-            v_l = np.empty_like(v); v_r = np.empty_like(v); v_t = np.empty_like(v); v_b = np.empty_like(v)
-            u_l[:, 0] = u[:, 0]; u_l[:, 1:] = u[:, :-1]
-            u_r[:, -1] = u[:, -1]; u_r[:, :-1] = u[:, 1:]
-            u_t[0, :] = u[0, :]; u_t[1:, :] = u[:-1, :]
-            u_b[-1, :] = u[-1, :]; u_b[:-1, :] = u[1:, :]
-            v_l[:, 0] = v[:, 0]; v_l[:, 1:] = v[:, :-1]
-            v_r[:, -1] = v[:, -1]; v_r[:, :-1] = v[:, 1:]
-            v_t[0, :] = v[0, :]; v_t[1:, :] = v[:-1, :]
-            v_b[-1, :] = v[-1, :]; v_b[:-1, :] = v[1:, :]
-            du_dx = np.float32(0.5) * (u_r - u_l) * np.float32(PHYSICS.dx_inv)
-            dv_dy = np.float32(0.5) * (v_b - v_t) * np.float32(PHYSICS.dy_inv)
-            du_dy = np.float32(0.5) * (u_b - u_t) * np.float32(PHYSICS.dy_inv)
-            dv_dx = np.float32(0.5) * (v_r - v_l) * np.float32(PHYSICS.dx_inv)
-            strain_mag = np.sqrt(np.maximum(np.float32(0.0), du_dx * du_dx + dv_dy * dv_dy + np.float32(0.5) * (du_dy + dv_dx) ** 2))
-            self.turb_k = np.maximum(np.float32(1e-6), np.float32(0.5) * (u * u + v * v)).astype(np.float32)
-            self.turb_eps = np.maximum(np.float32(self.chemistry_config.edc_min_epsilon), (np.float32(0.09) ** np.float32(0.75)) * self.turb_k * strain_mag).astype(np.float32)
+        use_flow = self.vel_x.shape == (rows, cols)
+        if not use_flow:
+            self.turb_k.fill(np.float32(1.0e-5))
+            self.turb_eps.fill(np.float32(self.chemistry_config.edc_min_epsilon))
+            vel_x = self._get_work_buffer("chem_vel_x", (rows, cols), np.float32)
+            vel_y = self._get_work_buffer("chem_vel_y", (rows, cols), np.float32)
+            vel_x.fill(np.float32(0.0))
+            vel_y.fill(np.float32(0.0))
         else:
-            self.turb_k.fill(np.float32(1e-5))
-            self.turb_eps.fill(np.float32(1e-4))
+            vel_x = np.asarray(self.vel_x, dtype=np.float32)
+            vel_y = np.asarray(self.vel_y, dtype=np.float32)
 
-        tau_mix = np.clip(self.turb_k / np.maximum(self.turb_eps, np.float32(self.chemistry_config.edc_min_epsilon)), self.chemistry_config.edc_tau_clip_min, self.chemistry_config.edc_tau_clip_max)
-        mix_factor = np.clip(np.float32(4.0) * self.mixture_fraction * (np.float32(1.0) - self.mixture_fraction), 0.0, 1.0)
-        edc_lim = mats["edc_c"] * np.minimum(fuel0, o20 / np.maximum(np.float32(1e-6), stoich)) / np.maximum(np.float32(1e-6), tau_mix)
-        base_poly = np.maximum(np.float32(1e-9), (fuel0 ** ord_f) * (o20 ** ord_o))
-        if self.chemistry_config.edc_enabled:
-            k_eff = np.minimum(k_arr, edc_lim / base_poly)
-        else:
-            k_eff = k_arr
-        k_eff = (k_eff * mix_factor).astype(np.float32)
-
-        xi = np.zeros_like(fuel0)
-        xi_max = np.minimum(fuel0, o20 / np.maximum(np.float32(1e-6), stoich))
-        active = (~mats["solid_mask"]) & (fuel0 > 1.0e-7) & (o20 > 1.0e-7) & (xi_max > 1.0e-9)
-
-        for _ in range(max(1, int(self.chemistry_config.stiff_newton_iterations))):
-            yf = np.maximum(np.float32(1e-12), fuel0 - xi)
-            yo = np.maximum(np.float32(1e-12), o20 - stoich * xi)
-            f = xi - dt * k_eff * (yf ** ord_f) * (yo ** ord_o)
-            df = np.float32(1.0) + dt * k_eff * (
-                ord_f * (yf ** np.maximum(np.float32(0.0), ord_f - np.float32(1.0))) * (yo ** ord_o)
-                + stoich * ord_o * (yf ** ord_f) * (yo ** np.maximum(np.float32(0.0), ord_o - np.float32(1.0)))
+        reacted = float(
+            _stiff_kinetics_edc_kernel(
+                self.fuel_vapor,
+                self.oxygen_level,
+                self.temperature,
+                self.co2_density,
+                self.co_density,
+                self.h2o_vapor,
+                self.mixture_fraction,
+                self.turb_k,
+                self.turb_eps,
+                vel_x,
+                vel_y,
+                mats["solid_mask"],
+                mats["A"],
+                mats["Ea"],
+                mats["ord_f"],
+                mats["ord_o"],
+                mats["stoich"],
+                mats["q_release"],
+                mats["edc_c"],
+                dt,
+                R,
+                np.float32(PHYSICS.dx_inv),
+                np.float32(PHYSICS.dy_inv),
+                self.chemistry_config.edc_enabled,
+                np.float32(self.chemistry_config.edc_min_epsilon),
+                np.float32(self.chemistry_config.edc_tau_clip_min),
+                np.float32(self.chemistry_config.edc_tau_clip_max),
+                np.float32(self.chemistry_config.arrhenius_temp_clamp_min),
+                np.float32(self.chemistry_config.arrhenius_temp_clamp_max),
+                max(1, int(self.chemistry_config.stiff_newton_iterations)),
+                use_flow,
             )
-            step = np.zeros_like(xi)
-            step[active] = f[active] / np.maximum(np.float32(1e-9), df[active])
-            xi = np.clip(xi - step, 0.0, xi_max)
+        )
 
-        if not np.any(active):
-            return
-
-        fuel_new = np.clip(fuel0 - xi, 0.0, 1.0)
-        o2_new = np.clip(o20 - stoich * xi, 0.0, 1.0)
-        rich = np.clip(np.float32(1.0) - (o20 / np.maximum(np.float32(1e-6), stoich * fuel0 + np.float32(1e-6))), 0.0, 1.0)
-        complete = np.float32(1.0) - rich
-
-        self.fuel_vapor = fuel_new.astype(np.float32)
-        self.oxygen_level = o2_new.astype(np.float32)
-        self.co2_density = np.clip(self.co2_density + xi * (np.float32(0.78) * complete + np.float32(0.3) * rich), 0.0, 2.0)
-        self.co_density = np.clip(self.co_density + xi * (np.float32(0.02) * complete + np.float32(0.45) * rich), 0.0, 1.0)
-        self.h2o_vapor = np.clip(self.h2o_vapor + xi * np.float32(0.5), 0.0, 2.0)
-
-        heat = mats["q_release"] * xi * (np.float32(0.7) + np.float32(0.3) * complete)
-        self.temperature = (self.temperature + (heat * np.float32(2.0e-5))).astype(np.float32)
-        self.mixture_fraction = np.clip(self.fuel_vapor / np.maximum(np.float32(1e-6), self.fuel_vapor + self.oxygen_level / np.maximum(np.float32(1e-6), stoich)), 0.0, 1.0)
-
-        reacted = float(np.sum(xi))
         if reacted > 1.0e-3:
             counters["changes"] += int(max(1, reacted * 8.0))
             events.append({"type": "stiff_combustion", "reacted": reacted})
@@ -3662,13 +4263,8 @@ class PowderPhysicsEngine:
         progress_drive = np.clip(dT / np.maximum(np.float32(1.0), mats["py_t1"] - mats["py_t0"]), 0.0, 1.0)
         q_rad = self.chemistry_config.pyrolysis_radiative_gain * np.maximum(np.float32(0.0), self.temperature - amb)
 
-        temp_l = np.empty_like(self.temperature); temp_r = np.empty_like(self.temperature)
-        temp_t = np.empty_like(self.temperature); temp_b = np.empty_like(self.temperature)
-        temp_l[:, 0] = self.temperature[:, 0]; temp_l[:, 1:] = self.temperature[:, :-1]
-        temp_r[:, -1] = self.temperature[:, -1]; temp_r[:, :-1] = self.temperature[:, 1:]
-        temp_t[0, :] = self.temperature[0, :]; temp_t[1:, :] = self.temperature[:-1, :]
-        temp_b[-1, :] = self.temperature[-1, :]; temp_b[:-1, :] = self.temperature[1:, :]
-        neighbor_avg = np.float32(0.25) * (temp_l + temp_r + temp_t + temp_b)
+        neighbor_avg = self._get_work_buffer("py_neighbor_avg", self.temperature.shape, np.float32)
+        _neighbor_avg4_numba(np.asarray(self.temperature, dtype=np.float32), neighbor_avg)
 
         q_conv = self.chemistry_config.pyrolysis_convective_gain * np.maximum(np.float32(0.0), neighbor_avg - self.temperature)
         q_cond = self.chemistry_config.pyrolysis_conductive_loss * np.maximum(np.float32(0.0), self.temperature - neighbor_avg)
@@ -4189,6 +4785,9 @@ class PowderPhysicsEngine:
             if self.pressure_solver_stats:
                 t["pressure_iters"] = float(self.pressure_solver_stats.get("iterations", 0))
                 t["pressure_residual"] = float(self.pressure_solver_stats.get("residual", 0.0))
+            if self.em_solver_stats:
+                t["em_substeps"] = float(self.em_solver_stats.get("substeps", 0))
+                t["em_current_rms"] = float(self.em_solver_stats.get("current_rms", 0.0))
         if self.config.enable_thermal:
             _s = time.perf_counter()
             self._stage_thermal(grid, rows, cols, tick_index, thermal_rng, counters, events)

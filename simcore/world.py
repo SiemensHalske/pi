@@ -98,6 +98,8 @@ MATERIALS = {
         "repose_angle": 90,
         "dispersion": 0,
         "drag": 0.0,
+        "electrical_conductivity": 5.0,
+        "magnetic_permeability": 1.2,
     },
     1: {
         "name": "Sand",
@@ -149,6 +151,9 @@ MATERIALS = {
         "repose_angle": 90,
         "dispersion": 0,
         "drag": 0.0,
+        "is_brittle": False,
+        "yield_strength": 1.0e9,
+        "thermal_expansion_coeff": 1.0e-6,
     },
     3: {
         "name": "Water",
@@ -181,6 +186,8 @@ MATERIALS = {
         "repose_angle": 0,
         "dispersion": 4,
         "drag": 0.2,
+        "electrical_conductivity": 1.2e-1,
+        "magnetic_permeability": 1.0,
     },
     4: {
         "name": "Wood",
@@ -190,20 +197,20 @@ MATERIALS = {
         "viscosity": 0.0,
         "thermal_capacity": 1.8,
         "thermal_conductivity": 0.18,
-        "ignition_temp": 275.0,
-        "auto_ignite_temp": 280.0,
-        "burn_rate": 0.004,
+        "ignition_temp": 240.0,
+        "auto_ignite_temp": 255.0,
+        "burn_rate": 0.010,
         "smoke_factor": 0.70,
         "ash_yield": 0.35,
         "char_yield": 0.15,
         "heat_of_combustion": 1000.0,
         "burnout_product": 7,
         "corrosion_resistance": 0.5,
-        "dissolution_rate": 0.01,
+        "dissolution_rate": 0.0,
         "passivation_factor": 0.08,
         "solubility_limit": 0.3,
         "corrosion_product": 7,
-        "dissolution_product": 0,
+        "dissolution_product": 7,
         "latent_heat": 5.0,
         "inertia": 0.0,
         "repose_angle": 90,
@@ -265,6 +272,9 @@ MATERIALS = {
         "repose_angle": 0,
         "dispersion": 5,
         "drag": 0.02,
+        "electrical_conductivity": 1.0e-2,
+        "magnetic_permeability": 1.0,
+        "ionization_temp": 600.0,
     },
     7: {
         "name": "Ash",
@@ -290,6 +300,8 @@ MATERIALS = {
         "repose_angle": 38,
         "dispersion": 2,
         "drag": 0.1,
+        "electrical_conductivity": 3.5e-1,
+        "magnetic_permeability": 1.05,
     },
     8: {
         "name": "Acid",
@@ -319,6 +331,8 @@ MATERIALS = {
         "repose_angle": 0,
         "dispersion": 4,
         "drag": 0.22,
+        "electrical_conductivity": 4.0e-1,
+        "magnetic_permeability": 1.0,
     },
     9: {
         "name": "Lava",
@@ -345,12 +359,15 @@ MATERIALS = {
         "initial_temp": 1050.0,
         "phase_change_rate": 0.008,
         "solidify_temp": 640.0,
-        "solidify_target": 2,
+        "solidify_target": 17,
         "latent_heat": 28.0,
         "inertia": 0.18,
         "repose_angle": 0,
         "dispersion": 2,
         "drag": 0.36,
+        "electrical_conductivity": 1.8,
+        "magnetic_permeability": 1.0,
+        "ionization_temp": 900.0,
     },
     10: {
         "name": "Fire",
@@ -455,6 +472,8 @@ MATERIALS = {
         "passivation_factor": 0.0,
         "solubility_limit": 0.5,
         "initial_temp": None,
+        "electrical_conductivity": 1.5e-1,
+        "magnetic_permeability": 1.0,
         "inertia": 0.12,
         "repose_angle": 34,
         "dispersion": 2,
@@ -511,6 +530,9 @@ MATERIALS = {
         "repose_angle": 0,
         "dispersion": 4,
         "drag": 0.01,
+        "electrical_conductivity": 6.0e-2,
+        "magnetic_permeability": 1.0,
+        "ionization_temp": 450.0,
     },
     16: {
         # Magma — superheated silicate melt, brighter and far hotter than lava.
@@ -545,6 +567,9 @@ MATERIALS = {
         "repose_angle": 0,
         "dispersion": 3,
         "drag": 0.28,
+        "electrical_conductivity": 2.2,
+        "magnetic_permeability": 1.0,
+        "ionization_temp": 1200.0,
     },
     17: {
         # Basalt — dark volcanic rock formed when Magma cools.
@@ -563,7 +588,7 @@ MATERIALS = {
         "min_oxygen_for_ignition": 1.0,
         "spark_sensitivity": 0.0,
         "corrosion_resistance": 0.95,
-        "dissolution_rate": 0.002,
+        "dissolution_rate": 0.0,
         "passivation_factor": 0.4,
         "solubility_limit": 0.0,
         "initial_temp": None,
@@ -575,6 +600,9 @@ MATERIALS = {
         "repose_angle": 90,
         "dispersion": 0,
         "drag": 0.0,
+        "is_brittle": False,
+        "yield_strength": 8.0e8,
+        "thermal_expansion_coeff": 5.0e-6,
     },
 }
 
@@ -648,6 +676,9 @@ MATERIAL_DEFAULTS = {
     "adsorption_fuel": 0.0,
     "adsorption_o2": 0.0,
     "surface_reaction_rate": 0.0,
+    "electrical_conductivity": 0.0,
+    "magnetic_permeability": 1.0,
+    "ionization_temp": 9999.0,
     "internal": False,
 }
 
@@ -871,6 +902,23 @@ class FluidModelConfig:
     porous_particle_diameter: float = 0.012
     porous_porosity: float = 0.45
     porous_drag_multiplier: float = 1.0
+    em_enabled: bool = True
+    em_low_speed_light: float = 2.0
+    em_substeps_min: int = 1
+    em_substeps_max: int = 8
+    em_eps0: float = 1.0
+    em_mu0: float = 1.0
+    em_damping: float = 0.012
+    em_background_bz: float = 0.0
+    em_current_scale: float = 0.04
+    mhd_lorentz_enabled: bool = True
+    mhd_lorentz_scale: float = 0.012
+    mhd_joule_heating_enabled: bool = True
+    mhd_joule_heating_scale: float = 0.02
+    plasma_confinement_enabled: bool = True
+    plasma_confinement_scale: float = 0.09
+    railgun_enabled: bool = True
+    railgun_debris_force_scale: float = 0.42
     validation_export_enabled: bool = True
     validation_export_path: str = "physics_validation.json"
 
@@ -880,7 +928,7 @@ class StructuralModelConfig:
     enabled: bool = True
     explicit_substeps: int = 2
     damping: float = 0.12
-    gravity_coupling: float = 1.0
+    gravity_coupling: float = 0.0
     thermal_strain_enabled: bool = True
     thermal_degradation_enabled: bool = True
     elastoplastic_enabled: bool = True

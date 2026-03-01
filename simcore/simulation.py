@@ -88,7 +88,14 @@ class Simulation:
                 "acoustic_u": self._copy_field(self.physics.acoustic_u),
                 "acoustic_v": self._copy_field(self.physics.acoustic_v),
                 "porous_resistance": self._copy_field(self.physics.porous_resistance),
+                "em_ex": self._copy_field(self.physics.em_ex),
+                "em_ey": self._copy_field(self.physics.em_ey),
+                "em_bz": self._copy_field(self.physics.em_bz),
+                "current_x": self._copy_field(self.physics.current_x),
+                "current_y": self._copy_field(self.physics.current_y),
+                "joule_heating_source": self._copy_field(self.physics.joule_heating_source),
                 "pressure_solver_stats": dict(self.physics.pressure_solver_stats),
+                "em_solver_stats": dict(self.physics.em_solver_stats),
                 "pde_validation_metrics": dict(self.physics.pde_validation_metrics),
                 # Phase 5 structural fields
                 "disp_x": self._copy_field(self.physics.disp_x),
@@ -169,7 +176,14 @@ class Simulation:
             self.physics.acoustic_u = self._copy_field(physics_state.get("acoustic_u", []))
             self.physics.acoustic_v = self._copy_field(physics_state.get("acoustic_v", []))
             self.physics.porous_resistance = self._copy_field(physics_state.get("porous_resistance", []))
+            self.physics.em_ex = self._copy_field(physics_state.get("em_ex", []))
+            self.physics.em_ey = self._copy_field(physics_state.get("em_ey", []))
+            self.physics.em_bz = self._copy_field(physics_state.get("em_bz", []))
+            self.physics.current_x = self._copy_field(physics_state.get("current_x", []))
+            self.physics.current_y = self._copy_field(physics_state.get("current_y", []))
+            self.physics.joule_heating_source = self._copy_field(physics_state.get("joule_heating_source", []))
             self.physics.pressure_solver_stats = dict(physics_state.get("pressure_solver_stats", {}))
+            self.physics.em_solver_stats = dict(physics_state.get("em_solver_stats", {}))
             self.physics.pde_validation_metrics = dict(physics_state.get("pde_validation_metrics", {}))
 
         # Phase 5 structural fields
@@ -227,6 +241,10 @@ class Simulation:
             if hasattr(self.physics.structural_config, key):
                 setattr(self.physics.structural_config, key, value)
 
+        for key, value in profile.get("electromagnetics", {}).items():
+            if hasattr(self.physics.fluid_config, key):
+                setattr(self.physics.fluid_config, key, value)
+
         self.profile_name = profile_name
         return True
 
@@ -247,6 +265,9 @@ class Simulation:
             "pressure_residual": [],
             "pressure_iterations": [],
             "pressure_active_fraction": [],
+            "current_rms": [],
+            "magnetic_energy": [],
+            "joule_mean": [],
             "pde_stage_ms": [],
             "fluid_stage_ms": [],
             "cfl": [],
@@ -264,6 +285,9 @@ class Simulation:
                 metrics["pressure_residual"].append(float(pressure_stats.get("residual", 0.0)))
                 metrics["pressure_iterations"].append(float(pressure_stats.get("iterations", 0.0)))
                 metrics["pressure_active_fraction"].append(float(pressure_stats.get("active_fraction", 0.0)))
+                metrics["current_rms"].append(float(pde_metrics.get("current_rms", 0.0)))
+                metrics["magnetic_energy"].append(float(pde_metrics.get("magnetic_energy", 0.0)))
+                metrics["joule_mean"].append(float(pde_metrics.get("joule_mean", 0.0)))
                 metrics["pde_stage_ms"].append(float(pde_metrics.get("pde_stage_ms", 0.0)))
                 metrics["fluid_stage_ms"].append(float(result.timings.get("fluids", 0.0)))
                 metrics["cfl"].append(float(self.physics.last_cfl))
@@ -346,7 +370,6 @@ class Simulation:
         if record_action:
             self._record_undo_snapshot()
 
-        paint_rng = self.physics.random_manager.for_tick(self.tick_index, "paint")
         for y in range(-radius, radius):
             for x in range(-radius, radius):
                 inside_brush = False
@@ -368,10 +391,10 @@ class Simulation:
                         if self.grid[r][c] != 0:
                             continue
 
-                        if paint_rng.random() > 0.2 or material_id in [MATERIAL_IDS["wall"], MATERIAL_IDS["wood"]]:
-                            self.grid[r][c] = material_id
-                            self.physics.apply_spawn_state(self.grid, r, c, material_id, self.rows, self.cols)
-                            changed = True
+                        # Deterministic placement: always fill the brush footprint for empty cells.
+                        self.grid[r][c] = material_id
+                        self.physics.apply_spawn_state(self.grid, r, c, material_id, self.rows, self.cols)
+                        changed = True
 
         if changed and record_action:
             self._record_replay_event({
